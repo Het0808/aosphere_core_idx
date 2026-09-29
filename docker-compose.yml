@@ -1,0 +1,136 @@
+# Local stack for testing a freshly extracted index against OpenSearch, in the same
+# shape as dev: the service reads its artifacts from a /data mount and serves search out
+# of an OpenSearch vector store rather than the in-process memory backend.
+#
+# The point of running it this way is that "works on my laptop with the memory backend"
+# proves very little about dev. The memory backend does exact cosine over a numpy matrix;
+# OpenSearch does approximate kNN over an HNSW graph with its own mapping, refresh and
+# shard behaviour. Recall and latency are only comparable once the store matches.
+#
+#   1. build the content layer from the extracted trees (host, CPU only):
+#        .venv/bin/python scripts/build_hybrid_index.py --out-data data-dpsd
+#
+#   2. embed with TITAN — the same embedder dev uses, so the vectors are promotable
+#      (bge is 384-dim and local-only; a bge index cannot be compared with dev's):
+#        aws sso login --sso-session tools1
+#        eval $(aws configure export-credentials --profile dev1 --format env)
+#        ACI_DATA_DIR=data-dpsd ACI_EMBED_BACKEND=titan ACI_BEDROCK_REGION=eu-west-1 \
+#            .venv/bin/aci reembed --force
+#
+#   3. up, then load the vectors into OpenSearch:
+#        docker compose up -d
+#        curl -XPOST 'http://localhost:8000/api/admin/reindex?backend=opensearch'
+#        curl 'http://localhost:8000/api/admin/reindex'          # progress
+#
+#   4. search, and compare against the memory backend for the same query:
+#        curl 'http://localhost:8000/api/search?q=data+breach+notification&k=5'
+#
+# Dashboards are off by default (they cost ~1GB of RAM): docker compose --profile ui up -d
+services:
+  opensearch:
+    image: opensearchproject/opensearch:2.19.4
+    container_name: aci-opensearch
+    environment:
+      - discovery.type=single-node
+      - bootstrap.memory_lock=true
+      # LOCAL ONLY. The security plugin is off so the service can talk plain HTTP without
+      # certs — dev1 runs with security on, reached over the pod's IAM role
+      # (ACI_OPENSEARCH_AWS_SERVICE). Never copy this into a deployed environment.
+      - DISABLE_SECURITY_PLUGIN=true
+      - DISABLE_INSTALL_DEMO_CONFIG=true
+      # 1g, not 2g: the Docker VM has ~7.6GB total and core-index needs room for the
+      # region-bundle cache (~22MB per region) plus the 320MB vector matrix a reindex
+      # loads. At 2g the stack OOM-killed core-index mid-session.
+      - OPENSEARCH_JAVA_OPTS=-Xms1g -Xmx1g
+    ulimits:
+      memlock: {soft: -1, hard: -1}
+      nofile: {soft: 65536, hard: 65536}
+    ports:
+      - "9200:9200"
+    volumes:
+      - opensearch-data:/usr/share/opensearch/data
+    healthcheck:
+      # `yellow` is success on a single node: every index has one replica it can never
+      # allocate, so `green` never arrives and waiting for it would hang forever.
+      test: ["CMD-SHELL", "curl -fs http://localhost:9200/_cluster/health | grep -qE '\"status\":\"(green|yellow)\"'"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+  core-index:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: aci-core-index
+    depends_on:
+      opensearch: {condition: service_healthy}
+    environment:
+      - ACI_DATA_DIR=/data
+      - ACI_OFFLINE=1
+      # Search served from OpenSearch, the way dev does it.
+      - ACI_VECTOR_BACKEND=opensearch
+      - ACI_OPENSEARCH_URL=http://opensearch:9200
+      - ACI_VECTOR_INDEX=aci-vectors
+      # Query embeddings MUST come from the same model the index was built with.
+      - ACI_EMBED_BACKEND=titan
+      - ACI_BEDROCK_REGION=eu-west-1
+      - AWS_REGION=eu-west-1
+      # Bedrock credentials come from docker-compose.override.yml (the SSO profile plus a
+      # ~/.aws mount), which is where this repo already keeps local AWS wiring. Setting
+      # them here too would shadow it with empty values.
+      # Opt-in, and only because this is a local box: it writes to the vector store.
+      - ACI_ADMIN_REINDEX=1
+      # LOCAL ONLY. Without this the image's baked Keycloak config makes every endpoint
+      # (including /api/admin/reindex, which loads the vector store) demand a bearer
+      # token, and there is no realm to get one from on a laptop. Never set this in a
+      # deployed environment — it disables authentication, not just the admin gate.
+      - ACI_AUTH_ENABLED=0
+      # Per-product master prompts, saved from the Prompts tab (AOSNG-3442). S3 is the
+      # production target; locally they live in a writable volume so the override path can
+      # actually be exercised. Unset, the service refuses saves with a reason instead.
+      - ACI_PROMPT_STORE_DIR=/prompts
+      # Entity/Spotlight search is a separate index that this stack does not build.
+      - ACI_ENTITY_SEARCH_BACKEND=none
+      # Doc Library: the published extraction viewers + scorecards. In dev these come from
+      # a private EU S3 bucket; locally the same DocStore reads a directory, so the tab
+      # shows the extractions this machine has actually published.
+      - ACI_DOC_GALLERY_DIR=/gallery
+      # Extraction monitor (the Extraction tab). Unlike the Doc Library there is no local
+      # equivalent: progress objects are written by GPU workers wherever they run, so the
+      # screen reads S3 directly. Credentials come from the same mounted SSO cache as Bedrock
+      # (docker-compose.override.yml), and the reads are LIST + a few small GETs per poll.
+      - ACI_EXTRACTION_BUCKET=aosphere-tenant-dev1-core-index
+      - ACI_EXTRACTION_PREFIX=corpus
+    volumes:
+      # The extracted index, exactly as dev mounts it: read-only at /data. Parameterised so a
+      # candidate index can be tested without editing this file:
+      #   ACI_LOCAL_DATA=./data-r5 docker compose up -d
+      - ${ACI_LOCAL_DATA:-./data-dpsd}:/data:ro
+      # The published Doc Library (viewers, scorecards, inspection pages), read-only.
+      - ./out/extractions:/gallery:ro
+      # WRITABLE, unlike the two above: this is where saved prompts go.
+      - ./out/prompts:/prompts
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/healthz').status==200 else 1)\""]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 60s
+
+  dashboards:
+    image: opensearchproject/opensearch-dashboards:2.19.4
+    container_name: aci-opensearch-dashboards
+    profiles: ["ui"]
+    depends_on:
+      opensearch: {condition: service_healthy}
+    environment:
+      - OPENSEARCH_HOSTS=["http://opensearch:9200"]
+      - DISABLE_SECURITY_DASHBOARDS_PLUGIN=true
+    ports:
+      - "5601:5601"
+
+volumes:
+  opensearch-data:

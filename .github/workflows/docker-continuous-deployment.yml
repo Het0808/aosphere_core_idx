@@ -1,0 +1,39 @@
+name: Continuous Deployment
+run-name: Continuous Build | Deployment - ${{ github.ref_name }} | ${{ inputs.version }} - ${{ inputs.environment }}
+
+on:
+  push:
+    tags:
+      - "[0-9]+.[0-9]+.[0-9]+-rc-[0-9]+"
+      - "[0-9]+.[0-9]+.[0-9]+-release-[0-9]+"
+      - "[0-9]+.[0-9]+.[0-9]+-dev-[0-9]+"
+  workflow_dispatch:
+    inputs:
+      version:
+        type: string
+        description: "Release version"
+        required: true
+      environment:
+        type: choice
+        description: "Choose Environment Type"
+        default: dev1
+        options:
+          - dev1
+          - stage1
+          - prod
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    uses: Skandiam/gh-action-library/.github/workflows/docker-continuous-deployment.yml@main
+    with:
+      version: ${{ inputs.version || '' }}
+      environment: ${{ inputs.environment || 'dev1' }}
+      service_name: core-index
+      values_service_key: coreIndex
+      # Pure-PyPI Python service: no CodeArtifact auth (default false). The image
+      # is built from the root Dockerfile; ECR push uses the ARC runner IRSA.
+    secrets: inherit

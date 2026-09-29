@@ -1,0 +1,24 @@
+.git
+.github
+# Every local virtualenv, not just `.venv`. A local `docker build` uses the WORKING TREE
+# as its context, so a dev venv lands in the image via `COPY . .` — and it brings its own
+# CVEs with it. Building this repo locally baked `.venv-mineru` (the arm64 MinerU pilot
+# venv) into /app and added 13 Trivy findings that have nothing to do with the service:
+# gradio, transformers, starlette, aiohttp, pypdf. CI never saw them because its context
+# is a clean git checkout, which is exactly what makes this the kind of gap that only
+# shows up when someone builds by hand.
+.venv*
+.env
+.env.*
+**/__pycache__
+**/*.pyc
+.ruff_cache
+*.egg-info
+# Index artifacts are NOT baked — they come from the /data volume mount.
+data/
+# Stage-1 extraction output is served from the /docs mount (dev) or S3 (prod), never baked.
+out/
+model-cache/
+docs/
+*.md
+!README.md

@@ -1,0 +1,21 @@
+# Product registry — onboarding a product is config, not core code.
+# Each product: how to read its docs (connector) and how to extract structure
+# (profile). Profile "data_privacy" = DP* style map (high fidelity); "generic" =
+# layout/heading inference for arbitrary PDF/DOCX/HTML.
+#
+# (The full product list + per-product profile assignment is pending from the
+# user; data_privacy is the one currently indexed.)
+products:
+  - id: 155
+    name: Data Privacy
+    connector: s3_working
+    profile: data_privacy
+    # current source layout (read-only): Advanced_Search/155_Data_Privacy/working/<Jurisdiction>/
+    prefix: Advanced_Search/155_Data_Privacy/working
+
+  # Template for a new product once its docs land in S3 staging:
+  # - id: <renderStyleId>
+  #   name: <Product Name>
+  #   connector: s3_staging          # s3://<staging-bucket>/<product>/<jurisdiction>/...
+  #   profile: data_privacy | generic
+  #   prefix: <product>/             # staging prefix

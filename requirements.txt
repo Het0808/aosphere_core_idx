@@ -1,0 +1,63 @@
+# Runtime dependencies for the cross-region search service (the deployed image).
+# Pure-PyPI; the offline image needs no AWS/Bedrock at request time.
+fastapi
+uvicorn[standard]
+starlette>=1.3.1          # floor clears CVE-2026-54283 (HIGH), per ai-playground
+fastembed                # local ONNX embeddings (pulls onnxruntime, tokenizers)
+numpy
+python-docx              # imported at module load (extraction path)
+lxml
+boto3                    # imported at module load (S3 source path; unused when ACI_OFFLINE=1)
+opensearch-py            # ACI_VECTOR_BACKEND=opensearch: k-NN retrieval vs a managed OpenSearch domain (SigV4 via boto3)
+pydantic>=2
+pydantic-settings
+PyJWT[crypto]            # Keycloak access-token validation (RS256 via realm JWKS), as in ai-playground
+cryptography>=50.0.0     # floor clears CVE-2026-69247 (HIGH); transitive via PyJWT[crypto]
+# CLI / build-time deps (the `aci` entrypoint imports these; build runs in-container too)
+typer
+rich
+networkx
+pyvis
+# AI Mode (agentic): OpenAI Agents SDK + LiteLLM (Bedrock) + MLflow tracing.
+# PINNED — unpinned ranges drifted on rebuild and broke AI Mode twice:
+#   * litellm floated past 1.89.3 to a build whose completion() imports its proxy/MCP
+#     handler (needs orjson, not a base dep) -> "No module named 'orjson'".
+#   * openai (transitive) floated past 2.43.0 to a build where InputTokensDetails now
+#     requires cache_write_tokens, which openai-agents 0.17.7 doesn't pass -> pydantic
+#     ValidationError.
+# Pin the whole AI subtree to the tested set. Bump deliberately (a lockfile would be
+# stronger — see requirements-lock recommendation).
+openai==2.43.0
+openai-agents==0.17.7
+litellm==1.89.3
+# CLIENT ONLY. The MLflow SERVER is deployed separately (devops); this service just
+# traces to it — llm/monitoring.py calls set_tracking_uri, set_experiment and
+# litellm.autolog and nothing else. Shipping the full `mlflow` package put the tracking
+# server, its UI, model serving and artifact handlers in our image, which is where
+# almost all of its CVEs live: 19 Trivy findings (6 CRITICAL, 11 HIGH) in mlflow 3.2.0,
+# plus 1 HIGH in pyarrow, which only arrived as an mlflow dependency.
+#
+# The full package could not be upgraded out of them either: every mlflow >=3.11.1 caps
+# `cryptography<50`, which contradicts the cryptography>=50 floor above (CVE-2026-69247).
+# mlflow-skinny has no such cap, so this takes the LATEST client and keeps that fix.
+#
+# Verified before switching: mlflow.set_tracking_uri / set_experiment /
+# mlflow.litellm.autolog all work on mlflow-skinny 3.15.1, and nothing in src/, scripts/
+# or tests/ imports any of the 29 packages this drops (mlflow, pyarrow, flask, sqlalchemy,
+# pandas, scipy, scikit-learn, matplotlib, gunicorn, ...).
+mlflow-skinny>=3.15.1
+msgpack>=1.2.1           # floor clears GHSA-6v7p-g79w-8964 (HIGH); transitive (litellm subtree)
+# gitpython is a transitive dep of mlflow-skinny (git metadata of runs; the service never
+# uses git directly). Floor to >=3.1.55 to clear 5 Trivy HIGHs in 3.1.52
+# (GHSA-3rp5-jjmw-4wv2, GHSA-6p8h-3wgx-97gf, GHSA-94p4-4cq8-9g67, GHSA-fjr4-x663-mwxc,
+# GHSA-r9mr-m37c-5fr3); within mlflow-skinny's own >=3.1.9,<4 range.
+gitpython>=3.1.55
+# Entity search (Spotlight): pymongo used by the /api/entity-search endpoint;
+# pymssql only by scripts/sync_atlas_search.py (not imported by the service)
+pymongo>=4.6
+pymssql
+certifi                  # CA bundle for Atlas TLS (python.org macOS installs)
+# mineru (optional extract_backend) is INTENTIONALLY absent here: it's a
+# build-time-only tool (pyproject.toml's `mineru` extra) — the deployed,
+# ACI_OFFLINE=1 image reads pre-baked content.json/sections.npz and never
+# re-parses documents, so the running service never needs it.

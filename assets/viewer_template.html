@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>__DOC_TITLE__ — MD/PDF Viewer</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<style>
+  :root {
+    --bg: #ffffff; --panel: #f5f5f7; --panel2: #ececef; --text: #000000;
+    --muted: #5a5a63; --accent: #2f5fd6; --border: #d8d8dd; --hover: #e8e8ec;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body { display: flex; flex-direction: column; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: var(--bg); color: var(--text); }
+  header { display: flex; align-items: center; gap: 12px; padding: 8px 14px; background: var(--panel); border-bottom: 1px solid var(--border); flex: 0 0 auto; }
+  header h1 { font-size: 14px; margin: 0; font-weight: 600; white-space: nowrap; }
+  header .sub { color: var(--muted); font-size: 12px; }
+  #stage-switch { display: flex; gap: 4px; margin-left: 14px; }
+  #stage-switch button { background: var(--panel2); border: 1px solid var(--border);
+    color: var(--muted); border-radius: 6px; padding: 4px 9px; font-size: 11px; cursor: pointer; }
+  #stage-switch button.on { color: var(--text); border-color: var(--accent); }
+  #stage-switch button:hover { color: var(--text); }
+  #search { margin-left: auto; background: var(--panel2); border: 1px solid var(--border); color: var(--text); border-radius: 6px; padding: 5px 10px; font-size: 12px; width: 220px; }
+  #main { display: flex; flex: 1 1 auto; min-height: 0; }
+
+  /* tree */
+  #tree { width: 300px; min-width: 180px; overflow: auto; background: var(--panel); border-right: 1px solid var(--border); padding: 8px 4px 40px; font-size: 12.5px; }
+  .dir > .label { cursor: pointer; display: flex; align-items: center; gap: 5px; padding: 3px 6px; border-radius: 5px; color: var(--text); font-weight: 600; }
+  .dir > .label:hover { background: var(--hover); }
+  .dir > .label .tw { display:inline-block; width: 10px; transition: transform .12s; color: var(--muted); font-size: 9px; }
+  .dir.open > .label .tw { transform: rotate(90deg); }
+  .dir > .kids { display: none; margin-left: 14px; border-left: 1px solid var(--border); padding-left: 4px; }
+  .dir.open > .kids { display: block; }
+  .file { cursor: pointer; padding: 3px 6px 3px 18px; border-radius: 5px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .file:hover { background: var(--hover); color: var(--text); }
+  .file.active { background: var(--accent); color: #ffffff; font-weight: 600; }
+  .hidden { display: none !important; }
+
+  /* splitters */
+  .split { width: 5px; cursor: col-resize; background: var(--border); flex: 0 0 auto; }
+  .split:hover { background: var(--accent); }
+
+  /* markdown pane */
+  #mdpane { flex: 1 1 45%; min-width: 240px; overflow: auto; padding: 24px 34px 80px; }
+  #mdpane .crumb { font-size: 11.5px; color: var(--muted); margin-bottom: 12px; }
+  #md { max-width: 860px; line-height: 1.62; font-size: 14.5px; }
+  #md h1 { font-size: 22px; border-bottom: 1px solid var(--border); padding-bottom: 8px; }
+  #md h2 { font-size: 17px; margin-top: 28px; }
+  #md h3 { font-size: 15px; }
+  #md a { color: var(--accent); }
+  #md hr { border: none; border-top: 1px solid var(--border); margin: 28px 0 14px; }
+  #md sup a { text-decoration: none; font-weight: 600; }
+  #md .fns { font-size: 12px; color: var(--muted); }
+  #md .fns p { margin: 4px 0; }
+  #md blockquote { border-left: 3px solid var(--accent); margin: 0; padding: 2px 14px 2px 28px; }
+  #md ul, #md ol { margin: 0; padding-left: 20px; }
+  #md li { margin: 4px 0; }
+  #md img { max-width: 100%; background: #fff; border-radius: 6px; }
+  #md table { border-collapse: collapse; margin: 10px 0; font-size: 13px; }
+  #md th, #md td { border: 1px solid var(--border); padding: 5px 9px; vertical-align: top; text-align: left; }
+  #md th { background: var(--panel2); }
+  #md :target { background: #fff3b0; border-radius: 3px; }
+  .pgbtn { background: var(--panel2); color: var(--accent); border: 1px solid var(--border); border-radius: 6px; padding: 6px 12px; cursor: pointer; font-size: 12.5px; margin: 4px 0; }
+  .pgbtn:hover { border-color: var(--accent); }
+
+  /* pdf pane */
+  #pdfpane { flex: 1 1 40%; min-width: 260px; display: flex; flex-direction: column; background: var(--panel2); }
+  #pdfbar { display: flex; align-items: center; gap: 8px; padding: 6px 10px; border-bottom: 1px solid var(--border); font-size: 12px; flex: 0 0 auto; }
+  #pdfbar button { background: var(--panel); color: var(--text); border: 1px solid var(--border); border-radius: 5px; padding: 3px 10px; cursor: pointer; font-size: 12px; }
+  #pdfbar button:hover { border-color: var(--accent); }
+  #pgnum { width: 52px; text-align: center; background: var(--panel); border: 1px solid var(--border); color: var(--text); border-radius: 5px; padding: 3px; }
+  #pdfscroll { flex: 1 1 auto; overflow: auto; text-align: center; padding: 12px; }
+  #pdfcanvas { box-shadow: 0 2px 14px rgba(0,0,0,.5); background: #fff; max-width: 100%; }
+  #sync { accent-color: var(--accent); }
+  label[for=sync] { color: var(--muted); user-select: none; cursor: pointer; }
+</style>
+</head>
+<body>
+<header>
+  <h1>__DOC_TITLE__</h1>
+  <span class="sub">__DOC_SUB__</span>
+  <span id="stage-switch"></span>
+  <input id="search" type="search" placeholder="Filter sections…">
+</header>
+<div id="main">
+  <nav id="tree"></nav>
+  <div class="split" id="s1"></div>
+  <section id="mdpane"><div class="crumb" id="crumb"></div><article id="md"><p style="color:var(--muted)">Select a file from the tree…</p></article></section>
+  <div class="split" id="s2"></div>
+  <section id="pdfpane">
+    <div id="pdfbar">
+      <button id="prev">‹</button>
+      <input id="pgnum" value="1"> <span id="pgtotal" style="color:var(--muted)">/ ?</span>
+      <button id="next">›</button>
+      <button id="zin">＋</button><button id="zout">−</button>
+      <span style="margin-left:auto"></span>
+      <input type="checkbox" id="sync" checked><label for="sync">follow section</label>
+    </div>
+    <div id="pdfscroll"><canvas id="pdfcanvas"></canvas></div>
+  </section>
+</div>
+<script id="data" type="application/json">__DATA_JSON__</script>
+<script>
+const DATA = JSON.parse(document.getElementById('data').textContent);
+const PDF_B64 = "__PDF_B64__";
+
+/* ---------- tree ---------- */
+const treeEl = document.getElementById('tree');
+let activeEl = null;
+function fileEl(f) {
+  const fe = document.createElement('div');
+  fe.className = 'file';
+  fe.textContent = f.name.replace(/\.md$/, '');
+  fe.dataset.path = f.path;
+  fe.onclick = () => openFile(f.path, fe);
+  return fe;
+}
+function renderChildren(node, container, depth) {
+  // interleave files + folders in numeric document order (01, 02, … regardless of
+  // whether a section is a leaf file or a folder); README pinned to the top.
+  const items = [...node.files.map(f => ({name: f.name, file: f})),
+                 ...node.dirs.map(d => ({name: d.name, dir: d}))];
+  items.sort((a, b) =>
+    a.name === 'README.md' ? -1 : b.name === 'README.md' ? 1 :
+    a.name.localeCompare(b.name, undefined, {numeric: true, sensitivity: 'base'}));
+  items.forEach(it => it.dir ? buildDir(it.dir, container, depth)
+                             : container.appendChild(fileEl(it.file)));
+}
+function buildDir(node, container, depth) {
+  const wrap = document.createElement('div');
+  wrap.className = 'dir' + (depth < 1 ? ' open' : '');
+  const label = document.createElement('div');
+  label.className = 'label';
+  label.innerHTML = '<span class="tw">▶</span><span>' + node.name + '</span>';
+  label.onclick = () => wrap.classList.toggle('open');
+  const kids = document.createElement('div');
+  kids.className = 'kids';
+  renderChildren(node, kids, depth + 1);
+  wrap.appendChild(label); wrap.appendChild(kids);
+  container.appendChild(wrap);
+}
+renderChildren(DATA.tree, treeEl, 0);
+
+/* Stage switcher — only for a document that HAS more than one stage. A document that
+   never went through AI post-processing has one tree and no switcher, exactly as before. */
+const STAGE_LABEL = { 3: 'Stage 3 — extraction', 4: 'Stage 4 — AI', 5: 'Stage 5 — sub-chunks' };
+let CUR_STAGE = DATA.stage;
+function renderStageSwitch() {
+  const el = document.getElementById('stage-switch');
+  if (!el || !DATA.stages || !(DATA.available || []).length) return;
+  if (DATA.available.length < 2) return;
+  el.innerHTML = DATA.available.map(s =>
+    '<button data-stage="' + s + '"' + (s === CUR_STAGE ? ' class="on"' : '') + '>'
+    + (STAGE_LABEL[s] || ('Stage ' + s)) + '</button>').join('');
+  el.querySelectorAll('button').forEach(b => b.onclick = () => {
+    const s = Number(b.dataset.stage);
+    if (s === CUR_STAGE) return;
+    const st = DATA.stages[String(s)];
+    if (!st) return;
+    CUR_STAGE = s;
+    /* Swap the active tree and repaint. The tree container is emptied first: renderChildren
+       APPENDS, and this is no longer a once-per-page call. */
+    DATA.tree = st.tree; DATA.files = st.files;
+    treeEl.innerHTML = '';
+    renderChildren(DATA.tree, treeEl, 0);
+    renderStageSwitch();
+    const first = treeEl.querySelector('[data-path]');
+    if (first) first.click();
+  });
+}
+renderStageSwitch();
+
+/* filter */
+document.getElementById('search').addEventListener('input', e => {
+  const q = e.target.value.toLowerCase();
+  treeEl.querySelectorAll('.file').forEach(f => {
+    f.classList.toggle('hidden', q && !f.dataset.path.toLowerCase().includes(q));
+  });
+  treeEl.querySelectorAll('.dir').forEach(d => {
+    const any = d.querySelectorAll('.file:not(.hidden)').length > 0;
+    d.classList.toggle('hidden', q && !any);
+    if (q && any) d.classList.add('open');
+  });
+});
+
+/* ---------- markdown ---------- */
+function renderFootnotes(mdText) {
+  mdText = mdText.replace(/\[\^(\d+)\]:\s?(.*)/g, '<p id="fn-$1"><b>$1.</b> $2</p>');
+  mdText = mdText.replace(/\[\^(\d+)\]/g, '<sup><a href="#fn-$1">$1</a></sup>');
+  return mdText;
+}
+function openFile(path, el, skipPdf) {
+  const f = DATA.files[path];
+  if (!f) return;
+  if (activeEl) activeEl.classList.remove('active');
+  if (el) { el.classList.add('active'); activeEl = el; el.scrollIntoView({block: 'nearest'}); }
+  document.getElementById('crumb').textContent = path;
+  const html = marked.parse(renderFootnotes(f.content), {mangle: false, headerIds: false});
+  document.getElementById('md').innerHTML = html;
+  document.getElementById('mdpane').scrollTop = 0;
+  // intercept relative md links -> open in viewer
+  document.querySelectorAll('#md a').forEach(a => {
+    const href = a.getAttribute('href') || '';
+    if (href.endsWith('.md') && !href.startsWith('http')) {
+      a.onclick = ev => {
+        ev.preventDefault();
+        const base = path.split('/').slice(0, -1);
+        const parts = href.replace(/^\.\//, '').split('/');
+        for (const p of parts) { if (p === '..') base.pop(); else base.push(p); }
+        const target = base.join('/');
+        const node = treeEl.querySelector('.file[data-path="' + CSS.escape(target) + '"]');
+        openFile(target, node);
+      };
+    }
+  });
+  // page snapshots: the images live on disk next to the md tree; inside the
+  // self-contained viewer, offer a jump to the live PDF page instead
+  document.querySelectorAll('#md img').forEach(im => {
+    const m = (im.getAttribute('src') || '').match(/page-(\d+)\.png$/);
+    if (m) {
+      const n = parseInt(m[1], 10);
+      const b = document.createElement('button');
+      b.className = 'pgbtn';
+      b.textContent = '📄 Complex table/diagram — view page ' + n + ' in the PDF pane';
+      b.onclick = () => gotoPage(n);
+      im.replaceWith(b);
+    }
+  });
+  if (!skipPdf && document.getElementById('sync').checked && f.page) gotoPage(f.page);
+}
+
+/* ---------- pdf ---------- */
+pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+let pdfDoc = null, curPage = 1, scale = 1.25, rendering = false, pendingPage = null;
+const canvas = document.getElementById('pdfcanvas'), ctx = canvas.getContext('2d');
+
+function renderPage(num) {
+  if (!pdfDoc) return;
+  rendering = true;
+  pdfDoc.getPage(num).then(page => {
+    const vp = page.getViewport({scale: scale * (window.devicePixelRatio || 1)});
+    canvas.width = vp.width; canvas.height = vp.height;
+    canvas.style.width = (vp.width / (window.devicePixelRatio || 1)) + 'px';
+    page.render({canvasContext: ctx, viewport: vp}).promise.then(() => {
+      rendering = false;
+      if (pendingPage !== null) { const p = pendingPage; pendingPage = null; renderPage(p); }
+    });
+  });
+  curPage = num;
+  document.getElementById('pgnum').value = num;
+}
+function gotoPage(n) {
+  if (!pdfDoc) { curPage = n; return; }
+  n = Math.max(1, Math.min(pdfDoc.numPages, n));
+  if (rendering) pendingPage = n; else renderPage(n);
+}
+document.getElementById('prev').onclick = () => gotoPage(curPage - 1);
+document.getElementById('next').onclick = () => gotoPage(curPage + 1);
+document.getElementById('zin').onclick = () => { scale = Math.min(3, scale + 0.2); renderPage(curPage); };
+document.getElementById('zout').onclick = () => { scale = Math.max(0.5, scale - 0.2); renderPage(curPage); };
+document.getElementById('pgnum').addEventListener('change', e => gotoPage(parseInt(e.target.value) || 1));
+document.getElementById('pdfscroll').addEventListener('keydown', e => {
+  if (e.key === 'ArrowRight') gotoPage(curPage + 1);
+  if (e.key === 'ArrowLeft') gotoPage(curPage - 1);
+});
+
+const raw = atob(PDF_B64);
+const bytes = new Uint8Array(raw.length);
+for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
+pdfjsLib.getDocument({data: bytes}).promise.then(doc => {
+  pdfDoc = doc;
+  document.getElementById('pgtotal').textContent = '/ ' + doc.numPages;
+  renderPage(curPage);
+});
+
+/* ---------- splitters ---------- */
+function makeSplit(splitEl, leftEl, min) {
+  splitEl.addEventListener('mousedown', e => {
+    e.preventDefault();
+    const startX = e.clientX, startW = leftEl.getBoundingClientRect().width;
+    function mv(ev) { leftEl.style.width = Math.max(min, startW + ev.clientX - startX) + 'px'; leftEl.style.flex = '0 0 auto'; }
+    function up() { document.removeEventListener('mousemove', mv); document.removeEventListener('mouseup', up); }
+    document.addEventListener('mousemove', mv); document.addEventListener('mouseup', up);
+  });
+}
+makeSplit(document.getElementById('s1'), document.getElementById('tree'), 160);
+makeSplit(document.getElementById('s2'), document.getElementById('mdpane'), 240);
+
+/* deep-link: #f=<section path> selects that section (used by the scorecard findings) */
+function selectByPath(path) {
+  const el = [...treeEl.querySelectorAll('.file')].find(f => f.dataset.path === path);
+  if (!el) return false;
+  let p = el.parentElement;                       // expand ancestor folders so it's visible
+  while (p && p !== treeEl) { if (p.classList && p.classList.contains('dir')) p.classList.add('open'); p = p.parentElement; }
+  openFile(path, el);
+  el.scrollIntoView({block: 'center'});
+  return true;
+}
+function openFromHash() {
+  const h = decodeURIComponent(location.hash.replace(/^#(f=)?/, ''));
+  return h ? selectByPath(h) : false;
+}
+window.addEventListener('hashchange', openFromHash);
+
+/* open the hash-targeted section, else README by default */
+const first = treeEl.querySelector('.file');
+if (!openFromHash() && first) openFile(first.dataset.path, first, true);
+</script>
+</body>
+</html>

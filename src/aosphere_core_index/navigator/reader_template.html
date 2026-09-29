@@ -1,0 +1,153 @@
+<title>aosphere GraphIndex — France reader</title>
+<style>
+  *{box-sizing:border-box}
+  body{margin:0;font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+       color:#1c2430;background:#eef1f5;height:100vh;overflow:hidden}
+  #app{display:grid;grid-template-columns:300px 1fr 340px;grid-template-rows:auto 1fr;height:100vh}
+  header{grid-column:1/4;display:flex;gap:14px;align-items:center;padding:10px 16px;
+         background:#11161f;color:#eef1f5;border-bottom:1px solid #0a0d12}
+  header h1{font-size:15px;margin:0;font-weight:650}
+  header .sub{font-size:12px;color:#9aa6b8}
+  header input{margin-left:auto;font:inherit;padding:7px 11px;border-radius:8px;border:1px solid #2a3140;
+        background:#0c0e12;color:#eef1f5;width:260px}
+  nav{background:#f7f9fc;border-right:1px solid #dce1e9;overflow:auto;padding:8px 0}
+  .toc{font-size:13px;line-height:1.35}
+  .toc a{display:block;padding:3px 10px;color:#2a3340;text-decoration:none;white-space:nowrap;
+         overflow:hidden;text-overflow:ellipsis;border-left:3px solid transparent}
+  .toc a:hover{background:#e7edf6}
+  .toc a.sel{background:#dbe7fb;border-left-color:#2563eb;font-weight:600}
+  .toc a .k{color:#6b7686;font-variant-numeric:tabular-nums;margin-right:6px}
+  main{overflow:auto;padding:26px 38px;background:#fff}
+  .crumb{color:#6b7686;font-size:12.5px;margin-bottom:6px}
+  main h2{font-size:21px;margin:.2em 0 .6em}
+  main .pill{display:inline-block;font-size:11px;color:#5b6678;background:#eef1f5;border:1px solid #dce1e9;
+        border-radius:999px;padding:1px 8px;margin-left:8px;vertical-align:middle}
+  main p{line-height:1.6;margin:.5em 0;font-size:14.5px}
+  main ul{margin:.3em 0 .6em 1.1em}
+  main li{line-height:1.55;margin:.15em 0;font-size:14.5px}
+  .q{background:#fdf2fb;border-left:3px solid #ec4899;padding:7px 11px;margin:.5em 0;border-radius:0 8px 8px 0;font-size:14px}
+  .rn{background:#fffbe9;border-left:3px solid #d9a400;padding:7px 11px;margin:.5em 0;border-radius:0 8px 8px 0;font-style:italic;color:#5c5326}
+  pre{background:#f4f6fa;border:1px solid #e1e6ee;border-radius:8px;padding:10px;overflow:auto;font-size:12px;white-space:pre-wrap}
+  .fn{margin-top:18px;border-top:1px solid #e1e6ee;padding-top:10px}
+  .fn h3{font-size:12px;text-transform:uppercase;letter-spacing:.6px;color:#6b7686;margin:0 0 6px}
+  .fn div{font-size:12px;color:#4a5566;margin:3px 0}
+  .fnref{color:#2563eb;font-weight:700;font-size:.72em;vertical-align:super;padding:0 1px}
+  .fn div:target{background:#fff3bf;border-radius:4px}
+  aside{background:#f7f9fc;border-left:1px solid #dce1e9;overflow:auto;padding:16px}
+  aside h3{font-size:11.5px;text-transform:uppercase;letter-spacing:.7px;color:#6b7686;margin:16px 0 7px}
+  .chip{display:inline-block;font-size:12px;background:#fff;border:1px solid #cfd6e2;border-radius:7px;
+        padding:3px 8px;margin:2px 3px 2px 0;cursor:pointer;color:#27405f}
+  .chip:hover{background:#e8f0fe;border-color:#2563eb}
+  .ans{border:1px solid #e1e6ee;border-radius:9px;padding:9px 11px;margin:7px 0;background:#fff}
+  .ans .qh{font-weight:600;font-size:12.5px;margin-bottom:4px;display:flex;gap:7px;align-items:center}
+  .ans .body{font-size:12.5px;color:#3a4555;line-height:1.5}
+  .dot{width:10px;height:10px;border-radius:50%;flex:none}
+  .alert{border-left:3px solid #ef4444;background:#fff;padding:8px 10px;margin:7px 0;border-radius:0 8px 8px 0}
+  .alert .t{font-weight:600;font-size:12.5px}
+  .alert .s{font-size:12px;color:#52607a;margin-top:3px}
+  .empty{color:#9aa6b8;font-size:12.5px}
+</style>
+
+<div id="app">
+  <header>
+    <h1>aosphere GraphIndex</h1>
+    <span class="sub" id="sub"></span>
+    <input id="search" placeholder="search text or jump to clause (e.g. C1.2(a))"/>
+  </header>
+  <nav><div class="toc" id="toc"></div></nav>
+  <main id="main"></main>
+  <aside id="aside"></aside>
+</div>
+
+<script>
+const DATA = __CONTENT_DATA__;
+const RATING={Green:"#16a34a",Amber:"#d97706",Red:"#dc2626"};
+const secByKey=new Map(DATA.sections.map(s=>[s.key,s]));
+const esc=s=>String(s==null?"":s).replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
+
+document.getElementById("sub").textContent =
+  `${DATA.doc.jurisdiction} · ${DATA.doc.product} · Opinion ${DATA.doc.opinion_id} · ${DATA.sections.length} sections`;
+
+// ---- TOC ----
+const toc=document.getElementById("toc");
+for(const s of DATA.sections){
+  const a=document.createElement("a");
+  a.style.paddingLeft=(10+s.level*12)+"px";
+  a.dataset.key=s.key;
+  a.innerHTML=`<span class="k">${esc(s.key)}</span>${esc(s.title)}`;
+  a.onclick=()=>open(s.key);
+  toc.appendChild(a);
+}
+
+function fmt(text){  // escape, then turn [^N] footnote markers into superscript links
+  return esc(text).replace(/\[\^(\d+)\]/g,(_m,n)=>`<sup class="fnref">[${n}]</sup>`);
+}
+function renderElements(els){
+  let html="",inUl=false;
+  for(const e of els){
+    if(e.kind==="bullet"){ if(!inUl){html+="<ul>";inUl=true;} html+=`<li>${fmt(e.text)}</li>`; continue; }
+    if(inUl){html+="</ul>";inUl=false;}
+    if(e.kind==="question") html+=`<div class="q"><b>Q.</b> ${fmt(e.text)}</div>`;
+    else if(e.kind==="readernote") html+=`<div class="rn">${fmt(e.text)}</div>`;
+    else if(e.kind==="table") html+=`<pre>${esc(e.text)}</pre>`;
+    else html+=`<p>${fmt(e.text)}</p>`;
+  }
+  if(inUl)html+="</ul>";
+  return html||"<p class='empty'>(no body text — heading only)</p>";
+}
+
+function open(key){
+  const s=secByKey.get(key); if(!s)return;
+  for(const a of toc.children) a.classList.toggle("sel", a.dataset.key===key);
+  const sel=toc.querySelector("a.sel"); if(sel) sel.scrollIntoView({block:"nearest"});
+
+  // breadcrumb
+  const crumbs=[]; let cur=s;
+  while(cur){crumbs.unshift(`${cur.key} ${cur.title}`); cur = cur.parent_key?secByKey.get(cur.parent_key):null;}
+  const main=document.getElementById("main");
+  main.scrollTop=0;
+  main.innerHTML =
+    `<div class="crumb">${esc(crumbs.join("  ›  "))}</div>`+
+    `<h2>[${esc(s.key)}] ${esc(s.title)}<span class="pill">level ${s.level}</span></h2>`+
+    renderElements(s.elements)+
+    (s.footnotes.length?`<div class="fn"><h3>Footnotes (${s.footnotes.length})</h3>`+
+       s.footnotes.map(f=>`<div><b>[${esc(f.id)}]</b> ${esc(f.text)}</div>`).join("")+`</div>`:"");
+
+  // links panel
+  const a=document.getElementById("aside");
+  const citesOut=s.cites_out||[], citedBy=DATA.cited_by[key]||[];
+  const answers=DATA.answers_by_clause[key]||[], alerts=DATA.alerts_by_clause[key]||[];
+  const chips=ks=>ks.length?ks.map(k=>{const t=secByKey.get(k);
+      return `<span class="chip" data-k="${esc(k)}">${esc(k)}${t?(" "+esc(t.title.slice(0,26))):""}</span>`;}).join("")
+      :`<span class="empty">none</span>`;
+  a.innerHTML =
+    `<h3>References → (${citesOut.length})</h3>${chips(citesOut)}`+
+    `<h3>Referenced by ← (${citedBy.length})</h3>${chips([...new Set(citedBy)])}`+
+    `<h3>Guidance — rated answers (${answers.length})</h3>`+
+      (answers.length?answers.map(r=>
+        `<div class="ans"><div class="qh"><span class="dot" style="background:${RATING[r.color]||"#888"}"></span>`+
+        `${esc(r.color)} · ${esc(r.subject)}</div>`+
+        `<div class="body"><b>${esc(r.question)}</b><br>${esc(r.answer)}</div></div>`).join("")
+        :`<span class="empty">none</span>`)+
+    `<h3>Alerts (${alerts.length})</h3>`+
+      (alerts.length?alerts.map(al=>`<div class="alert"><div class="t">${esc(al.title)} `+
+        `<span class="empty">${esc(al.impact)}</span></div><div class="s">${esc(al.summary)}</div></div>`).join("")
+        :`<span class="empty">none</span>`);
+  for(const c of a.querySelectorAll(".chip")) c.onclick=()=>open(c.dataset.k);
+}
+
+// ---- search ----
+document.getElementById("search").addEventListener("keydown",ev=>{
+  if(ev.key!=="Enter")return;
+  const q=ev.target.value.trim();
+  if(secByKey.has(q)){open(q);return;}
+  const lc=q.toLowerCase();
+  const hit=DATA.sections.find(s=>s.key.toLowerCase()===lc) ||
+    DATA.sections.find(s=>s.title.toLowerCase().includes(lc)) ||
+    DATA.sections.find(s=>s.elements.some(e=>e.text.toLowerCase().includes(lc)));
+  if(hit)open(hit.key); else alert("no match for: "+q);
+});
+
+// open the consent clause by default to show grounded content + guidance
+open(secByKey.has("C1.2(a)")?"C1.2(a)":DATA.sections[0].key);
+</script>

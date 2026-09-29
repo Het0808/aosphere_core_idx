@@ -1,0 +1,20 @@
+name: Trivy PR Scan
+
+on:
+  pull_request:
+    branches: [main, alpha, beta]
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+  id-token: write
+
+jobs:
+  scan:
+    uses: Skandiam/gh-action-library/.github/workflows/trivy-pr-scan.yml@main
+    with:
+      service_name: core-index
+      # Pure-PyPI Python service: no CodeArtifact auth (default false).
+      platforms: linux/arm64
+    secrets: inherit

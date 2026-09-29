@@ -1,0 +1,63 @@
+[project]
+name = "aosphere-core-index"
+version = "0.1.0"
+description = "Lean, quality-first GraphIndex over the aosphere advanced-search store"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "boto3>=1.35",
+    "python-docx>=1.1",
+    "networkx>=3.3",
+    "pyvis>=0.3.2",
+    "typer>=0.12",
+    "pydantic>=2.8",
+    "pydantic-settings>=2.4",
+    "rich>=13.7",
+    "pyyaml>=6.0",
+    # Not a direct import here — floor exists so `uv sync`/`uv run` never downgrades it
+    # under requirements.txt's anyio/fastapi (installed separately, see README), which
+    # need `typing_extensions.sentinel` (added in 4.16). uv.lock has no visibility into
+    # requirements.txt, so without this floor every `uv run` silently reverts to
+    # whatever anyio-less resolution this project's own deps allow (4.15, no sentinel)
+    # and breaks the service on the next launch.
+    "typing_extensions>=4.16",
+]
+
+[project.optional-dependencies]
+# Build-time-only extraction backend (extract_backend="mineru"). Opt in with
+# `uv sync --extra mineru` — pulls multi-GB ML deps (torch, OCR/layout models),
+# so it stays out of the default sync. Never needed at runtime: the deployed,
+# ACI_OFFLINE=1 service reads pre-baked content.json/sections.npz and never
+# re-parses documents, so this is intentionally absent from requirements.txt.
+mineru = ["mineru[all]"]
+# EXTRACTION-TIME ONLY, and light (unlike `mineru`): PyMuPDF is what reads the PDFs in
+# pdf2mdtree, the verification checks and their tests. Deliberately NOT in requirements.txt
+# — the deployed ACI_OFFLINE=1 service reads pre-baked artifacts and never re-parses a
+# document — but CI must have it, or every extraction test fails at IMPORT and the suite
+# reports "passed" for the ones that happened to collect.
+extract = ["pymupdf>=1.24"]
+
+[project.scripts]
+aci = "aosphere_core_index.cli:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/aosphere_core_index"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+# Tolerated existing style (so CI is a real gate, not a big-bang reformat):
+# E402 — the service intentionally configures logging before importing app modules;
+# E702/E741 — compact one-liner style in cli.py / section_index.py.
+# Revisit these when those files are next refactored.
+ignore = ["E402", "E702", "E741"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

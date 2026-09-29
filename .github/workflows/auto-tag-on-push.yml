@@ -1,0 +1,17 @@
+name: Auto Tagging
+on:
+  push:
+    branches:
+      - main
+      - alpha
+      - beta
+    paths-ignore:
+      - '.github/**'
+  workflow_dispatch:
+
+run-name: Auto Tagging for ${{ github.ref_name }} by ${{ github.actor }}
+
+jobs:
+  auto-tagging:
+    uses: Skandiam/gh-action-library/.github/workflows/auto-tag-on-push.yml@main
+    secrets: inherit

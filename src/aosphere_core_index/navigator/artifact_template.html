@@ -1,0 +1,203 @@
+<title>aosphere GraphIndex — France navigator</title>
+<style>
+  :root{
+    --bg:#0f1115; --panel:#171a21; --line:#262b36; --text:#e6e9ef; --muted:#9aa3b2;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+       background:var(--bg);color:var(--text);height:100vh;overflow:hidden}
+  #app{display:grid;grid-template-columns:1fr 320px;grid-template-rows:auto 1fr;height:100vh}
+  header{grid-column:1/3;display:flex;align-items:center;gap:14px;padding:10px 16px;
+         background:var(--panel);border-bottom:1px solid var(--line);flex-wrap:wrap}
+  header h1{font-size:15px;margin:0;font-weight:650;letter-spacing:.2px}
+  header .sub{color:var(--muted);font-size:12px}
+  .ctrl{margin-left:auto;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+  input,button{font:inherit;border-radius:8px;border:1px solid var(--line);
+        background:#0c0e12;color:var(--text);padding:6px 10px}
+  button{cursor:pointer;background:#1d2230}
+  button:hover{background:#283044}
+  button.primary{background:#2563eb;border-color:#2563eb}
+  #canvasWrap{position:relative;overflow:hidden}
+  canvas{display:block;width:100%;height:100%}
+  #tip{position:absolute;pointer-events:none;background:#0b0d11ee;border:1px solid var(--line);
+       padding:7px 9px;border-radius:8px;font-size:12px;max-width:340px;display:none;z-index:5;
+       box-shadow:0 8px 24px #0008}
+  aside{background:var(--panel);border-left:1px solid var(--line);padding:14px;overflow:auto}
+  aside h2{font-size:12px;text-transform:uppercase;letter-spacing:.8px;color:var(--muted);margin:14px 0 8px}
+  #sel .label{font-weight:600;margin-bottom:4px}
+  #sel .crumb{color:var(--muted);font-size:12px;margin-bottom:8px;word-break:break-word}
+  .rel{display:flex;gap:6px;align-items:center;padding:5px 7px;border-radius:7px;cursor:pointer;font-size:12.5px}
+  .rel:hover{background:#222838}
+  .relkind{color:var(--muted);font-size:11px;min-width:90px}
+  .legend{display:flex;flex-direction:column;gap:5px}
+  .legend div{display:flex;align-items:center;gap:8px;font-size:12.5px}
+  .dot{width:11px;height:11px;border-radius:50%;flex:none}
+  .hint{color:var(--muted);font-size:11.5px;line-height:1.5}
+</style>
+
+<div id="app">
+  <header>
+    <h1>aosphere GraphIndex</h1>
+    <span class="sub">France · Data Privacy · 2,985 nodes · 3,934 links · pre-vectorization</span>
+    <div class="ctrl">
+      <input id="search" placeholder="jump to clause e.g. C1.2(a)" size="20"/>
+      <button id="consent" class="primary">▶ Consent example</button>
+      <button id="reset">Reset</button>
+    </div>
+  </header>
+  <div id="canvasWrap"><canvas id="c"></canvas><div id="tip"></div></div>
+  <aside>
+    <div id="sel"><div class="hint">Click a node to inspect it and expand its links.
+      Drag to pan, scroll to zoom, drag a node to reposition.</div></div>
+    <h2>Relations</h2>
+    <div id="rels"></div>
+    <h2>Legend</h2>
+    <div class="legend" id="legend"></div>
+    <h2>How AI navigates</h2>
+    <div class="hint">Vector search lands on a <b>question</b> or <b>chunk</b>; the graph then
+      back-traces <b>cites</b> / <b>has_rated_answer</b> / <b>has_subsection</b> edges to the
+      authoritative <b>clause</b> that grounds the answer.</div>
+  </aside>
+</div>
+
+<script>
+const GRAPH = __GRAPH_DATA__;
+const COLORS = {jurisdiction:"#3b82f6",opinion:"#a855f7",document:"#22c55e",section:"#06b6d4",
+  chunk:"#94a3b8",footnote:"#a3a635",template:"#f97316",subject:"#fdba74",question:"#ec4899",
+  rated_answer:"#9333ea",alert:"#ef4444"};
+const RATING={Green:"#16a34a",Amber:"#d97706",Red:"#dc2626"};
+const SIZE={jurisdiction:13,document:12,opinion:11,section:8,question:8,rated_answer:8,alert:9,
+  template:9,subject:8,footnote:5,chunk:6};
+
+const byId=new Map(GRAPH.nodes.map(n=>[n.id,n]));
+const out=new Map(), inc=new Map();
+for(const n of GRAPH.nodes){out.set(n.id,[]);inc.set(n.id,[]);}
+for(const e of GRAPH.edges){out.get(e.s).push(e);inc.get(e.d).push(e);}
+const colorOf=n=>n.t==="rated_answer"&&RATING[n.col]?RATING[n.col]:(COLORS[n.t]||"#888");
+const sizeOf=n=>SIZE[n.t]||6;
+
+// ---- view state ----
+const cv=document.getElementById("c"), ctx=cv.getContext("2d"), wrap=document.getElementById("canvasWrap");
+let visible=new Set(), pos=new Map(), tx=0,ty=0,scale=1, selected=null;
+function resize(){cv.width=wrap.clientWidth;cv.height=wrap.clientHeight;}
+window.addEventListener("resize",resize);resize();
+
+function place(id,nearId){
+  if(pos.has(id))return;
+  const b=nearId&&pos.get(nearId)||{x:cv.width/2,y:cv.height/2};
+  pos.set(id,{x:b.x+(Math.random()*80-40),y:b.y+(Math.random()*80-40),vx:0,vy:0});
+}
+function show(id,nearId){if(!byId.has(id))return;visible.add(id);place(id,nearId);}
+function expand(id){show(id);for(const e of out.get(id)){show(e.d,id);}for(const e of inc.get(id)){show(e.s,id);}}
+
+function reset(){
+  visible=new Set();pos=new Map();selected=null;
+  const doc=GRAPH.nodes.find(n=>n.t==="document");
+  expand(doc.id);
+  // also pull in jurisdiction/opinion
+  for(const n of GRAPH.nodes) if(["jurisdiction","opinion"].includes(n.t)) show(n.id,doc.id);
+  fit();render();sidebar(null);
+}
+function consentExample(){
+  visible=new Set();pos=new Map();
+  const q=GRAPH.nodes.find(n=>n.t==="question"&&/consent.*permit/i.test(n.l));
+  if(!q){reset();return;}
+  expand(q.id);
+  // expand the answer + its cited clauses, and the clause parents
+  for(const e of out.get(q.id)) if(e.r==="has_rated_answer"){expand(e.d);
+    for(const e2 of out.get(e.d)) if(e2.r==="cites"){expand(e2.d);}}
+  selected=q.id;fit();render();sidebar(q.id);
+}
+
+// ---- force layout ----
+function step(){
+  const ids=[...visible], P=ids.map(i=>pos.get(i));
+  for(let a=0;a<ids.length;a++)for(let b=a+1;b<ids.length;b++){
+    const p=P[a],q=P[b];let dx=p.x-q.x,dy=p.y-q.y,d2=dx*dx+dy*dy+.01;
+    const f=2600/d2;const d=Math.sqrt(d2);dx/=d;dy/=d;
+    p.vx+=dx*f;p.vy+=dy*f;q.vx-=dx*f;q.vy-=dy*f;
+  }
+  for(const e of GRAPH.edges){if(!visible.has(e.s)||!visible.has(e.d))continue;
+    const p=pos.get(e.s),q=pos.get(e.d);let dx=q.x-p.x,dy=q.y-p.y,d=Math.hypot(dx,dy)+.01;
+    const f=(d-90)*0.015;dx/=d;dy/=d;p.vx+=dx*f;p.vy+=dy*f;q.vx-=dx*f;q.vy-=dy*f;}
+  const cx=cv.width/2,cy=cv.height/2;
+  for(const p of P){p.vx+=(cx-p.x)*0.0008;p.vy+=(cy-p.y)*0.0008;
+    p.x+=p.vx*=0.86;p.y+=p.vy*=0.86;}
+}
+function fit(){for(let i=0;i<120;i++)step();}
+
+function toScreen(p){return {x:p.x*scale+tx,y:p.y*scale+ty};}
+function fromScreen(x,y){return {x:(x-tx)/scale,y:(y-ty)/scale};}
+
+function render(){
+  ctx.clearRect(0,0,cv.width,cv.height);
+  ctx.lineWidth=1;
+  for(const e of GRAPH.edges){if(!visible.has(e.s)||!visible.has(e.d))continue;
+    const a=toScreen(pos.get(e.s)),b=toScreen(pos.get(e.d));
+    const hot=selected&&(e.s===selected||e.d===selected);
+    ctx.strokeStyle=hot?"#9fb3ff":"#33415588";ctx.beginPath();ctx.moveTo(a.x,a.y);ctx.lineTo(b.x,b.y);ctx.stroke();
+  }
+  for(const id of visible){const n=byId.get(id),s=toScreen(pos.get(id)),r=sizeOf(n)*Math.sqrt(scale);
+    ctx.beginPath();ctx.arc(s.x,s.y,r,0,7);ctx.fillStyle=colorOf(n);ctx.fill();
+    if(id===selected){ctx.strokeStyle="#fff";ctx.lineWidth=2;ctx.stroke();}
+    if(scale>0.7||["jurisdiction","document","section","question","rated_answer","alert"].includes(n.t)){
+      ctx.fillStyle="#dfe5f0";ctx.font="11px sans-serif";
+      ctx.fillText((n.k?("["+n.k+"] "):"")+n.l, s.x+r+3, s.y+3, 220);
+    }
+  }
+}
+
+// ---- interaction ----
+let hoverId=null,dragId=null,panning=false,last=null;
+function pick(mx,my){let best=null,bd=1e9;
+  for(const id of visible){const s=toScreen(pos.get(id));const d=Math.hypot(s.x-mx,s.y-my);
+    if(d<Math.max(8,sizeOf(byId.get(id))*scale)&&d<bd){bd=d;best=id;}}return best;}
+cv.addEventListener("mousemove",ev=>{
+  const r=cv.getBoundingClientRect(),mx=ev.clientX-r.left,my=ev.clientY-r.top;
+  if(dragId){const w=fromScreen(mx,my);const p=pos.get(dragId);p.x=w.x;p.y=w.y;p.vx=p.vy=0;render();return;}
+  if(panning){tx+=mx-last.x;ty+=my-last.y;last={x:mx,y:my};render();return;}
+  const id=pick(mx,my);const tip=document.getElementById("tip");
+  if(id){const n=byId.get(id);hoverId=id;
+    tip.style.display="block";tip.style.left=(mx+14)+"px";tip.style.top=(my+10)+"px";
+    tip.innerHTML="<b>"+(n.k?("["+n.k+"] "):"")+escapeHtml(n.l)+"</b><br><span style='color:#9aa3b2'>"+n.t+
+      (n.bc?("<br>"+escapeHtml(n.bc)):"")+"</span>";
+    cv.style.cursor="pointer";
+  }else{hoverId=null;tip.style.display="none";cv.style.cursor=panning?"grabbing":"default";}
+});
+cv.addEventListener("mousedown",ev=>{const r=cv.getBoundingClientRect(),mx=ev.clientX-r.left,my=ev.clientY-r.top;
+  const id=pick(mx,my);if(id){dragId=id;}else{panning=true;last={x:mx,y:my};}});
+window.addEventListener("mouseup",()=>{if(dragId){} dragId=null;panning=false;});
+cv.addEventListener("click",ev=>{const r=cv.getBoundingClientRect(),mx=ev.clientX-r.left,my=ev.clientY-r.top;
+  const id=pick(mx,my);if(id){selected=id;expand(id);fit();render();sidebar(id);}});
+cv.addEventListener("wheel",ev=>{ev.preventDefault();const r=cv.getBoundingClientRect(),mx=ev.clientX-r.left,my=ev.clientY-r.top;
+  const f=ev.deltaY<0?1.12:0.89;const w=fromScreen(mx,my);scale*=f;tx=mx-w.x*scale;ty=my-w.y*scale;render();},{passive:false});
+
+function sidebar(id){
+  const sel=document.getElementById("sel"),rels=document.getElementById("rels");
+  if(!id){sel.innerHTML="<div class='hint'>Click a node to inspect it and expand its links.</div>";rels.innerHTML="";return;}
+  const n=byId.get(id);
+  sel.innerHTML="<div class='label'>"+(n.k?("["+n.k+"] "):"")+escapeHtml(n.l)+"</div>"+
+    "<div class='crumb'>"+n.t+(n.bc?(" · "+escapeHtml(n.bc)):"")+"</div>";
+  const items=[];
+  for(const e of out.get(id))items.push([e.r+" →",e.d]);
+  for(const e of inc.get(id))items.push(["← "+e.r,e.s]);
+  rels.innerHTML="";
+  for(const [k,other] of items.slice(0,60)){const o=byId.get(other);
+    const div=document.createElement("div");div.className="rel";
+    div.innerHTML="<span class='relkind'>"+k+"</span><span class='dot' style='background:"+colorOf(o)+
+      "'></span><span>"+(o.k?("["+o.k+"] "):"")+escapeHtml(o.l)+"</span>";
+    div.onclick=()=>{selected=other;show(other,id);expand(other);fit();render();sidebar(other);};
+    rels.appendChild(div);}
+}
+function escapeHtml(s){return String(s).replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));}
+
+document.getElementById("legend").innerHTML=Object.entries(COLORS).map(([t,c])=>
+  "<div><span class='dot' style='background:"+c+"'></span>"+t+"</div>").join("");
+document.getElementById("reset").onclick=reset;
+document.getElementById("consent").onclick=consentExample;
+document.getElementById("search").addEventListener("keydown",ev=>{if(ev.key!=="Enter")return;
+  const k=ev.target.value.trim();const n=GRAPH.nodes.find(x=>x.t==="section"&&x.k===k);
+  if(n){selected=n.id;expand(n.id);fit();render();sidebar(n.id);}else alert("clause not found: "+k);});
+
+consentExample();
+</script>

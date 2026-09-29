@@ -1,0 +1,41 @@
+# Local-only override (do NOT commit). Points core-index at the DEV Keycloak and lets the
+# container mint/REFRESH dev1 AWS creds from the mounted SSO cache (Bedrock: query embed +
+# rerank + AI Mode). Using the SSO *profile* + a read-only ~/.aws mount means boto3 refreshes
+# role creds for the whole SSO-session lifetime — no more hourly "security token expired".
+# Requires a valid host SSO session:
+#
+#   aws sso login --sso-session tools1
+#   ACI_HTTP_PORT=8090 docker compose up -d
+#   open http://localhost:8090/
+#
+# When the SSO session lapses (~daily): re-run `aws sso login --sso-session tools1` on the
+# host — the container reads the refreshed cache on its next call (no rebuild needed).
+services:
+  core-index:
+    environment:
+      # dev Keycloak auth wall (mirrors ai-playground; redirect allows localhost:8090)
+      KEYCLOAK_URL: https://auth.dev1.aoslogin.net
+      KEYCLOAK_REALM: aosphere
+      KEYCLOAK_AUDIENCE: ai-playground-client
+      KEYCLOAK_CLIENT_ID: ai-playground-client
+      # Bedrock via the SSO PROFILE (auto-refresh from the mounted ~/.aws), NOT a static
+      # snapshot. AWS_PROFILE covers the default chain (reranker + AI Mode agent);
+      # ACI_BEDROCK_PROFILE covers the embedder's explicit session.
+      AWS_PROFILE: dev1
+      ACI_BEDROCK_PROFILE: dev1
+      AWS_REGION: ${AWS_REGION:-eu-west-1}
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-eu-west-1}
+      # Atlas entity search (/spotlight + /api/entity-search) — from ./.env at `up` time
+      MONGODB_URI: ${MONGODB_URI:-}
+      MONGODB_USERNAME: ${MONGODB_USERNAME:-}
+      MONGODB_PASSWORD: ${MONGODB_PASSWORD:-}
+      ATLAS_DB: ${ATLAS_DB:-aosphere_search}
+      ATLAS_COLLECTION: ${ATLAS_COLLECTION:-entities}
+    volumes:
+      # WRITABLE on purpose. botocore does not just READ a refreshed SSO token, it
+      # PERSISTS it: it writes a temp file into ~/.aws/sso/cache and renames it. With :ro
+      # that raised "[Errno 30] Read-only file system" from inside the query path, so every
+      # /api/search returned 500 the moment the token came due for refresh — the exact
+      # failure this mount was added to prevent. The container needs write access to the
+      # cache for the auto-refresh described above to work at all.
+      - ${HOME}/.aws:/root/.aws:rw   # SSO cache + config → container refreshes its own creds

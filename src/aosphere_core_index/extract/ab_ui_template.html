@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Extractor A/B — legacy vs MinerU</title>
+<style>
+  :root {
+    --ink:#1d2b4f; --ink-soft:#33436e; --paper:#edeff3; --raised:#fff;
+    --legacy:#9c6f1e; --legacy-soft:#f3e6cc; --mineru:#1f7a72; --mineru-soft:#d9ede9;
+    --rule:#c7ccd6; --muted:#5b6472; --focus:#3061d6; --bad:#b0392f; --bad-soft:#f6e3e0;
+    --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;
+    --mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;
+    --serif:"Iowan Old Style",Palatino,Georgia,serif;
+  }
+  @media (prefers-color-scheme:dark){:root{--ink:#dfe6f5;--ink-soft:#aebbdb;--paper:#14161b;--raised:#1b1e26;
+    --legacy:#d9ac5c;--legacy-soft:#3a2f1a;--mineru:#3fa79b;--mineru-soft:#15302c;--rule:#313644;--muted:#99a2b1;
+    --focus:#6f9bff;--bad:#e0776b;--bad-soft:#3a2320;}}
+  *{box-sizing:border-box;} html,body{height:100%;}
+  body{margin:0;background:var(--paper);color:var(--ink);font-family:var(--sans);-webkit-font-smoothing:antialiased;}
+  button,select,input{font-family:inherit;}
+
+  .upload{min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:1.2rem;padding:2rem;text-align:center;}
+  .upload h1{font-family:var(--serif);font-size:1.7rem;margin:0;}
+  .upload p{color:var(--muted);max-width:52ch;margin:0;font-size:.9rem;line-height:1.5;}
+  .drop{width:min(460px,90vw);border:2px dashed var(--rule);border-radius:8px;padding:1.8rem;background:var(--raised);cursor:pointer;}
+  .drop.drag{border-color:var(--mineru);background:var(--mineru-soft);}
+  .drop input{display:none;}
+  .drop .icon{font-family:var(--serif);font-size:2rem;color:var(--mineru);}
+  .drop .hint{font-size:.76rem;color:var(--muted);margin-top:.4rem;}
+  .picked{font-family:var(--mono);font-size:.82rem;color:var(--ink-soft);}
+  .row{display:flex;align-items:center;gap:.6rem;font-size:.85rem;}
+  select{background:var(--raised);color:var(--ink);border:1px solid var(--rule);border-radius:6px;padding:.4rem .6rem;}
+  .go{background:var(--ink);color:var(--raised);border:none;padding:.6rem 1.6rem;border-radius:999px;font-size:.85rem;font-weight:600;cursor:pointer;}
+  .go:disabled{opacity:.4;cursor:not-allowed;}
+  .go2{background:var(--mineru);color:#fff;border:none;padding:.45rem 1.1rem;border-radius:999px;font-size:.8rem;font-weight:600;cursor:pointer;}
+  .go2:disabled{opacity:.4;cursor:not-allowed;}
+  .cachedbar{display:flex;flex-direction:column;align-items:center;gap:.5rem;margin-top:.4rem;padding-top:1rem;border-top:1px solid var(--rule);width:min(460px,90vw);}
+  .cachedbar .or{font-size:.72rem;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;}
+  .err{color:var(--bad);font-size:.85rem;max-width:60ch;}
+  .spinner{width:32px;height:32px;border-radius:50%;border:3px solid var(--rule);border-top-color:var(--mineru);animation:spin .9s linear infinite;}
+  @keyframes spin{to{transform:rotate(360deg);}}
+  .proc{display:none;flex-direction:column;align-items:center;gap:.8rem;}
+  .proc .el{font-family:var(--mono);font-size:.78rem;color:var(--muted);}
+  .legend{display:flex;gap:1.4rem;font-size:.76rem;color:var(--muted);}
+  .legend .sw{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:.35em;}
+
+  .shell{display:none;min-height:100vh;flex-direction:column;}
+  .shell.active{display:flex;}
+  header.top{display:flex;align-items:center;gap:1rem;padding:.8rem 1.3rem;flex-wrap:wrap;border-bottom:1px solid var(--rule);
+    background:var(--raised);position:sticky;top:0;z-index:5;}
+  header.top h1{font-family:var(--serif);font-size:1.05rem;margin:0;flex:1;}
+  header.top .fname{font-family:var(--mono);font-size:.78rem;color:var(--muted);}
+  .newbtn{background:none;border:1px solid var(--rule);border-radius:999px;padding:.35rem .9rem;font-size:.75rem;color:var(--muted);cursor:pointer;}
+  .cols{display:grid;grid-template-columns:1fr 1fr;flex:1;min-height:0;}
+  @media (max-width:900px){.cols{grid-template-columns:1fr;}}
+  .col{display:flex;flex-direction:column;border-right:1px solid var(--rule);min-height:0;}
+  .col:last-child{border-right:none;}
+  .chead{padding:.85rem 1.1rem;border-bottom:1px solid var(--rule);}
+  .chead .name{font-family:var(--serif);font-size:1.15rem;font-weight:700;display:flex;align-items:center;gap:.5em;}
+  .chead .name .sw{width:10px;height:10px;border-radius:3px;}
+  .col.legacy .chead{border-top:3px solid var(--legacy);} .col.legacy .sw{background:var(--legacy);}
+  .col.mineru .chead{border-top:3px solid var(--mineru);} .col.mineru .sw{background:var(--mineru);}
+  .stats{display:flex;gap:1.1rem;flex-wrap:wrap;margin-top:.5rem;font-family:var(--mono);font-size:.73rem;}
+  .stat b{font-size:.95rem;color:var(--ink);font-variant-numeric:tabular-nums;} .stat span{display:block;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;font-size:.62rem;}
+  .cbody{flex:1;overflow:auto;padding:.4rem 0 2rem;}
+  .status{margin:1rem 1.1rem;padding:.8rem 1rem;border-radius:4px;font-size:.82rem;line-height:1.5;}
+  .status.na{background:var(--bad-soft);color:var(--bad);border-left:3px solid var(--bad);}
+
+  table.flat{width:100%;border-collapse:collapse;font-size:.8rem;}
+  table.flat thead th{position:sticky;top:0;background:var(--raised);text-align:left;font-size:.63rem;text-transform:uppercase;
+    letter-spacing:.06em;color:var(--muted);font-weight:700;padding:.4rem .6rem;border-bottom:1px solid var(--rule);}
+  table.flat td{padding:.38rem .6rem;border-bottom:1px solid var(--rule);vertical-align:top;}
+  tr.frow{cursor:pointer;} tr.frow:hover{background:var(--paper);}
+  td.lvl{font-family:var(--mono);font-size:.72rem;color:var(--muted);white-space:nowrap;}
+  td.key{font-family:var(--mono);font-weight:700;white-space:nowrap;}
+  td.par{font-family:var(--mono);font-size:.72rem;color:var(--muted);white-space:nowrap;}
+  td.fn{font-family:var(--mono);font-size:.72rem;color:var(--muted);text-align:right;}
+  tr.det{display:none;} tr.det.show{display:table-row;}
+  tr.det td{padding:.2rem .6rem .7rem 2.2rem;background:var(--paper);}
+  .el{margin:.35rem 0;font-size:.8rem;}
+  .badge{font-family:var(--mono);font-size:.6rem;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);
+    border:1px solid var(--rule);border-radius:999px;padding:.05em .5em;margin-right:.5em;}
+  .txt{color:var(--ink-soft);white-space:pre-wrap;}
+  .eltable{border-collapse:collapse;font-size:.75rem;margin-top:.2rem;}
+  .eltable td{border:1px solid var(--rule);padding:.25rem .5rem;}
+  .empty{color:var(--muted);font-style:italic;padding:1rem 1.1rem;font-size:.82rem;}
+</style>
+</head>
+<body>
+<div class="upload" id="upload">
+  <h1>Extractor A/B — legacy vs MinerU</h1>
+  <p>Upload one document. A <b>.docx</b> runs through both extractors; a <b>PDF</b> runs MinerU only
+     (legacy reads Word styles, which a PDF doesn't have). Everything runs locally.</p>
+  <label class="drop" id="drop">
+    <input type="file" id="file" accept=".docx,.pdf">
+    <div class="icon">⌥</div>
+    <div id="droptext">Drop a .docx or .pdf here, or click to choose</div>
+    <div class="hint">MinerU shells out to the local model — a PDF can take a few minutes</div>
+  </label>
+  <div class="picked" id="picked"></div>
+  <div class="row"><label for="product">Product template:</label>
+    <select id="product"><option>Shareholding Disclosure</option><option>Data Privacy</option><option>Generic</option></select></div>
+  <div class="row"><label for="minerumode">MinerU parse mode:</label>
+    <select id="minerumode">
+      <option value="vlm-engine">vlm-engine · full VLM (best)</option>
+      <option value="hybrid-engine|medium">hybrid · medium (faster, no image/chart)</option>
+      <option value="hybrid-engine|high">hybrid · high (image/chart analysis)</option>
+      <option value="pipeline">pipeline · CPU (layout+OCR only)</option>
+    </select></div>
+  <div class="hint" style="max-width:48ch">Parse mode applies to a live PDF upload. Cached documents keep whatever mode produced them (shown in the picker).</div>
+  <button class="go" id="go" disabled>Run comparison</button>
+  <div class="cachedbar">
+    <div class="or">— or view an already-parsed document, instantly —</div>
+    <div class="row"><select id="cached"><option value="">loading cached documents…</option></select>
+      <button class="go2" id="viewcached" disabled>View chunks</button></div>
+    <div class="hint">Renders the MinerU chunk tree from cached output — no model run, no wait</div>
+  </div>
+  <div class="proc" id="proc"><div class="spinner"></div><div id="procmsg">Running both extractors…</div><div class="el" id="elapsed"></div></div>
+  <div class="err" id="err"></div>
+  <div class="legend"><span><span class="sw" style="background:var(--legacy)"></span>legacy docx</span>
+    <span><span class="sw" style="background:var(--mineru)"></span>MinerU</span></div>
+</div>
+
+<div class="shell" id="shell">
+  <header class="top"><h1>legacy vs MinerU</h1><span class="fname" id="fname"></span>
+    <button class="newbtn" id="new">Upload another</button></header>
+  <div class="cols"><div class="col legacy" id="col-legacy"></div><div class="col mineru" id="col-mineru"></div></div>
+</div>
+
+<script>
+(function(){
+  const $=id=>document.getElementById(id);
+  const drop=$('drop'),file=$('file'),picked=$('picked'),go=$('go'),proc=$('proc'),err=$('err'),elapsed=$('elapsed');
+  let chosen=null,timer=null;
+
+  ['dragover','dragleave','drop'].forEach(ev=>drop.addEventListener(ev,e=>{
+    e.preventDefault();drop.classList.toggle('drag',ev==='dragover');
+    if(ev==='drop'&&e.dataTransfer.files.length)pick(e.dataTransfer.files[0]);}));
+  file.addEventListener('change',()=>file.files.length&&pick(file.files[0]));
+  function pick(f){chosen=f;picked.textContent=`${f.name} (${(f.size/1024).toFixed(0)} KB)`;go.disabled=false;err.textContent='';}
+
+  go.addEventListener('click',async()=>{
+    if(!chosen)return;
+    go.disabled=true;drop.style.display='none';picked.style.display='none';err.textContent='';proc.style.display='flex';
+    const t0=Date.now();timer=setInterval(()=>elapsed.textContent=`${Math.round((Date.now()-t0)/1000)}s — MinerU can take several minutes`,1000);
+    const fd=new FormData();fd.append('file',chosen);fd.append('product',$('product').value);
+    const mm=$('minerumode').value.split('|');fd.append('mineru_backend',mm[0]);if(mm[1])fd.append('effort',mm[1]);
+    try{
+      const r=await fetch('/api/compare',{method:'POST',body:fd});
+      if(!r.ok)throw new Error((await r.json()).detail||`HTTP ${r.status}`);
+      const d=await r.json();
+      $('fname').textContent=d.filename||'';
+      render('col-legacy','Legacy (docx styles)',d.legacy);
+      render('col-mineru','MinerU (CLI)',d.mineru);
+      $('upload').style.display='none';$('shell').classList.add('active');
+    }catch(e){err.textContent='Couldn’t run comparison: '+e.message;drop.style.display='';picked.style.display='';go.disabled=false;}
+    finally{clearInterval(timer);proc.style.display='none';}
+  });
+  $('new').addEventListener('click',()=>location.reload());
+
+  // Cached documents: render the MinerU chunk tree instantly (no CLI run).
+  const cachedSel=$('cached'),viewCached=$('viewcached');
+  fetch('/api/cached').then(r=>r.json()).then(list=>{
+    if(!list.length){cachedSel.innerHTML='<option value="">no cached documents found</option>';return;}
+    cachedSel.innerHTML='<option value="">— pick a cached document —</option>'+
+      list.map(it=>`<option value="${esc(it.path)}">${esc(it.name)} · ${esc(it.backend)}</option>`).join('');
+  }).catch(()=>{cachedSel.innerHTML='<option value="">could not list cache</option>';});
+  cachedSel.addEventListener('change',()=>viewCached.disabled=!cachedSel.value);
+  viewCached.addEventListener('click',async()=>{
+    if(!cachedSel.value)return;
+    viewCached.disabled=true;err.textContent='';proc.style.display='flex';
+    $('procmsg').textContent='Rendering cached chunk tree…';elapsed.textContent='';
+    const fd=new FormData();fd.append('path',cachedSel.value);fd.append('product',$('product').value);
+    try{
+      const r=await fetch('/api/cached',{method:'POST',body:fd});
+      if(!r.ok)throw new Error((await r.json()).detail||`HTTP ${r.status}`);
+      const d=await r.json();
+      $('fname').textContent=(d.filename||'')+' — cached';
+      render('col-legacy','Legacy (docx styles)',d.legacy);
+      render('col-mineru','MinerU (cached)',d.mineru);
+      $('upload').style.display='none';$('shell').classList.add('active');
+    }catch(e){err.textContent='Couldn’t render cached document: '+e.message;viewCached.disabled=false;}
+    finally{proc.style.display='none';}
+  });
+
+  const esc=s=>String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+
+  function render(elId,label,data){
+    const el=$(elId);
+    if(!data||data.unavailable||data.error){
+      const na=data&&data.unavailable;const reason=data?(data.unavailable||data.error):'no result';
+      el.innerHTML=`<div class="chead"><div class="name"><span class="sw"></span>${label}</div></div>
+        <div class="cbody"><div class="status ${na?'na':'na'}"><b>${na?'Not applicable':'Failed'}:</b> ${esc(reason)}</div></div>`;
+      return;
+    }
+    const s=data.summary,fn=data.footnotes||{};
+    const stat=(v,l)=>`<div class="stat"><b>${v}</b><span>${l}</span></div>`;
+    const lvls=Object.entries(s.levels||{}).map(([k,v])=>`${v}·L${k}`).join('  ');
+    const modeStat=s.mode?`<div class="stat"><b style="font-size:.8rem">${esc(s.mode)}</b><span>mode</span></div>`:'';
+    el.innerHTML=`<div class="chead"><div class="name"><span class="sw"></span>${label}</div>
+      <div class="stats">${stat(s.sections,'sections')}${stat(s.parts,'parts')}${stat(s.tables,'tables')}${stat(s.footnotes,'footnotes')}${stat(s.elapsed_s+'s','elapsed')}${modeStat}</div>
+      <div class="stats" style="color:var(--muted)">${esc(lvls)}</div></div>
+      <div class="cbody"><div id="${elId}-b"></div></div>`;
+    buildTable(elId+'-b',data.sections,fn);
+  }
+
+  function buildTable(hostId,sections,fn){
+    const host=$(hostId);
+    if(!sections.length){host.innerHTML='<div class="empty">No sections extracted.</div>';return;}
+    const rows=sections.map((sec,i)=>{
+      const els=sec.elements.length?sec.elements.map(e=>{
+        if(e.kind==='table'){
+          const trs=e.text.split('\n').map(r=>`<tr>${r.split(' | ').map(c=>`<td>${esc(c)}</td>`).join('')}</tr>`).join('');
+          return `<div class="el"><span class="badge">table</span><table class="eltable">${trs}</table></div>`;
+        }
+        return `<div class="el"><span class="badge">${esc(e.kind)}</span><span class="txt">${esc(e.text)}</span></div>`;
+      }).join(''):'<div class="el txt" style="font-style:italic;color:var(--muted)">heading only, no own text</div>';
+      const fnrows=(sec.footnote_ids||[]).map(id=>`<div class="el"><span class="badge" style="color:var(--focus);border-color:var(--focus)">fn ${esc(id)}</span><span class="txt">${esc(fn[id]||'')}</span></div>`).join('');
+      const indent=(0.6+(sec.level||0)*1.15).toFixed(2);
+      return `<tr class="frow" data-i="${i}"><td class="lvl">L${sec.level}</td><td class="key">${esc(sec.key)}</td>
+        <td class="par">${sec.parent_key?esc(sec.parent_key):'—'}</td><td style="padding-left:${indent}rem">${esc(sec.title)}</td><td class="fn">${sec.footnote_ids.length||''}</td></tr>
+        <tr class="det" data-d="${i}"><td colspan="5">${fnrows}${els}</td></tr>`;
+    }).join('');
+    host.innerHTML=`<table class="flat"><thead><tr><th>Lvl</th><th>Key</th><th>Parent</th><th>Title</th><th>FN</th></tr></thead><tbody>${rows}</tbody></table>`;
+    host.querySelectorAll('.frow').forEach(r=>r.addEventListener('click',()=>{
+      const d=host.querySelector(`.det[data-d="${r.dataset.i}"]`);if(d)d.classList.toggle('show');}));
+  }
+})();
+</script>
+</body>
+</html>

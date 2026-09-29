@@ -1,0 +1,54 @@
+# Watch a promotion run, locally.
+#
+# The base stack (docker-compose.yml) already has everything a promotion needs to be
+# WATCHED — OpenSearch, the service with ACI_EXTRACTION_BUCKET so the Extraction tab reads
+# run progress from S3, auth off. This overlay adds the three things it does not have:
+#
+#   1. ACI_ADMIN_PROMOTE=1        the Promotion panel and the promote buttons exist at all
+#   2. the gallery from S3        so a STAGED index version is browsable before cutover —
+#                                 the base stack points the gallery at a local directory,
+#                                 which cannot show index/<version>/doc-gallery/
+#   3. short cache TTLs           the defaults (300s run, 60s manifest) are right for a
+#                                 deployed service and far too slow to watch anything
+#
+#   aws sso login --sso-session tools1
+#   eval "$(aws configure export-credentials --profile dev1 --format env)"
+#   ACI_LOCAL_DATA=./data-r5 docker compose \
+#       -f docker-compose.yml -f docker-compose.promotion.yml up -d --build
+#   open http://localhost:8000/            -> Extraction tab -> Promotion panel
+#
+# Then, in another shell, run the promotion (see docs/PROMOTION_PIPELINE.md):
+#   python scripts/promote_run.py --run <run_id> --plan
+#
+# NOTE ON THE DATA MOUNT. /data is mounted read-only from ACI_LOCAL_DATA and its path is
+# fixed when the container starts, exactly as it is in the cluster. So after a promotion
+# flips index/latest, THIS container still serves the old content.json until you recreate
+# it against the new data dir — which is the local rehearsal of the pod roll the cluster
+# needs, and the reason the promotion's final report says so:
+#
+#   ACI_LOCAL_DATA=./data-<version> docker compose \
+#       -f docker-compose.yml -f docker-compose.promotion.yml up -d --force-recreate core-index
+services:
+  core-index:
+    environment:
+      # The write endpoints (POST /api/promotion/request, /stop) 404 without this, and
+      # /api/config reports promotion:false so the UI hides the buttons rather than
+      # offering ones that fail. Local only — it is an admin write gate.
+      ACI_ADMIN_PROMOTE: "1"
+      # Gallery from S3, NOT the local directory the base stack mounts. Deliberately no
+      # ACI_DOC_GALLERY_PREFIX: unset means "follow index/latest", which is what the
+      # deployed reader does — pinning it here would show a version the promotion is not
+      # writing to. A staged version is reached with ?version=<v> instead.
+      ACI_DOC_GALLERY_BUCKET: aosphere-tenant-dev1-core-index
+      ACI_DOC_GALLERY_REGION: eu-west-1
+      # Watching, not serving: a promotion moves in seconds and the deployed TTLs would
+      # make the screen look stuck. Both are still caches — a run only ever grows and the
+      # manifest is written last, so a stale read under-reports and never invents.
+      ACI_GALLERY_RUN_TTL: "30"
+      ACI_GALLERY_MANIFEST_TTL: "10"
+      # Static creds from the host SSO session, so the container needs no ~/.aws mount for
+      # the S3 reads. Populate before `up`:
+      #   eval "$(aws configure export-credentials --profile dev1 --format env)"
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
