@@ -1,0 +1,395 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Chunk &amp; Knowledge-Graph Viewer</title>
+<style>
+  :root {
+    --ink: #1d2b4f; --ink-soft: #33436e; --paper: #edeff3; --paper-raised: #ffffff;
+    --gold: #9c6f1e; --gold-soft: #f3e6cc; --rule: #c7ccd6; --muted: #5b6472; --focus: #3061d6;
+    --radius: 3px;
+    --serif: Iowan Old Style, "Palatino Linotype", Palatino, Georgia, serif;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    --mono: ui-monospace, "SF Mono", "Cascadia Code", Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --ink: #dfe6f5; --ink-soft: #aebbdb; --paper: #14161b; --paper-raised: #1b1e26;
+      --gold: #d9ac5c; --gold-soft: #3a2f1a; --rule: #313644; --muted: #99a2b1; --focus: #6f9bff; }
+  }
+  :root[data-theme="dark"] { --ink: #dfe6f5; --ink-soft: #aebbdb; --paper: #14161b; --paper-raised: #1b1e26;
+    --gold: #d9ac5c; --gold-soft: #3a2f1a; --rule: #313644; --muted: #99a2b1; --focus: #6f9bff; }
+  :root[data-theme="light"] { --ink: #1d2b4f; --ink-soft: #33436e; --paper: #edeff3; --paper-raised: #ffffff;
+    --gold: #9c6f1e; --gold-soft: #f3e6cc; --rule: #c7ccd6; --muted: #5b6472; --focus: #3061d6; }
+
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body { margin: 0; background: var(--paper); color: var(--ink); font-family: var(--sans); -webkit-font-smoothing: antialiased; }
+  a { color: inherit; }
+  :focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+  button { font-family: inherit; }
+
+  /* ---- upload screen ---- */
+  .upload-screen {
+    height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 1.4rem; padding: 2rem; text-align: center;
+  }
+  .upload-screen h1 { font-family: var(--serif); font-size: 1.7rem; margin: 0; text-wrap: balance; }
+  .upload-screen p { color: var(--muted); max-width: 46ch; margin: 0; font-size: 0.9rem; line-height: 1.5; }
+  .dropzone {
+    width: min(480px, 90vw); border: 2px dashed var(--rule); border-radius: 8px; padding: 2.4rem 1.5rem;
+    background: var(--paper-raised); cursor: pointer; transition: border-color 0.15s;
+  }
+  .dropzone.drag { border-color: var(--gold); background: var(--gold-soft); }
+  .dropzone input { display: none; }
+  .dropzone .icon { font-family: var(--serif); font-size: 2rem; color: var(--gold); margin-bottom: 0.4rem; }
+  .dropzone .hint { font-size: 0.78rem; color: var(--muted); margin-top: 0.3rem; }
+  .backend-note { font-family: var(--mono); font-size: 0.72rem; color: var(--muted); }
+  .file-picked { font-family: var(--mono); font-size: 0.82rem; color: var(--ink-soft); }
+  .go-btn {
+    background: var(--ink); color: var(--paper-raised); border: none; padding: 0.6rem 1.6rem;
+    border-radius: 999px; font-size: 0.85rem; font-weight: 600; cursor: pointer;
+  }
+  .go-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .error-msg { color: #b0392f; font-size: 0.85rem; max-width: 46ch; }
+
+  /* ---- processing state ---- */
+  .processing { display: flex; flex-direction: column; align-items: center; gap: 1rem; }
+  .spinner {
+    width: 34px; height: 34px; border-radius: 50%; border: 3px solid var(--rule);
+    border-top-color: var(--gold); animation: spin 0.9s linear infinite;
+  }
+  @media (prefers-reduced-motion: reduce) { .spinner { animation: none; } }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .processing .elapsed { font-family: var(--mono); font-size: 0.78rem; color: var(--muted); }
+
+  /* ---- viewer shell (same design as the static demo) ---- */
+  .shell {
+    display: none; grid-template-columns: 300px minmax(0, 1fr) 300px; grid-template-rows: auto 1fr;
+    grid-template-areas: "head head head" "nav main meta"; height: 100vh;
+  }
+  .shell.active { display: grid; }
+  @media (max-width: 980px) {
+    .shell { grid-template-columns: 260px minmax(0, 1fr); grid-template-areas: "head head" "nav main"; }
+    .meta { display: none; }
+  }
+  header.top { grid-area: head; display: flex; align-items: baseline; gap: 1.25rem; padding: 0.85rem 1.5rem;
+    border-bottom: 1px solid var(--rule); background: var(--paper-raised); }
+  header.top h1 { font-family: var(--serif); font-size: 1.15rem; font-weight: 600; margin: 0; text-wrap: balance; }
+  header.top .doc-sub { font-size: 0.8rem; color: var(--muted); }
+  header.top .stats { margin-left: auto; display: flex; gap: 1.4rem; font-family: var(--mono); font-size: 0.78rem; }
+  header.top .stat { display: flex; flex-direction: column; gap: 0.15rem; align-items: flex-end; }
+  header.top .stats b { font-variant-numeric: tabular-nums; color: var(--ink); font-weight: 600; }
+  header.top .stats span { color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; font-size: 0.66rem; }
+  header.top .new-btn { background: none; border: 1px solid var(--rule); border-radius: 999px; padding: 0.3rem 0.9rem;
+    font-size: 0.75rem; color: var(--muted); cursor: pointer; }
+
+  nav.tree { grid-area: nav; overflow-y: auto; border-right: 1px solid var(--rule); background: var(--paper-raised);
+    padding: 0.75rem 0.4rem 2rem; }
+  nav.tree details { margin-left: 0.7rem; }
+  nav.tree details > summary { list-style: none; cursor: pointer; }
+  nav.tree details > summary::-webkit-details-marker { display: none; }
+  nav.tree .node { display: flex; align-items: baseline; gap: 0.4rem; padding: 0.22rem 0.5rem; border-radius: var(--radius);
+    font-size: 0.83rem; line-height: 1.35; }
+  nav.tree .node:hover { background: var(--paper); }
+  nav.tree .node.active { background: var(--gold-soft); color: var(--ink); font-weight: 600; }
+  nav.tree summary .node::before { content: "▸"; color: var(--muted); font-size: 0.65rem; width: 0.8em; }
+  nav.tree details[open] > summary .node::before { content: "▾"; }
+  nav.tree .leaf .node::before { content: ""; width: 0.8em; }
+  nav.tree .node .dot { width: 5px; height: 5px; border-radius: 50%; background: var(--gold); flex: none; margin-top: 0.45em; opacity: 0.85; }
+  nav.tree .node .label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  nav.tree .node .order { margin-left: auto; font-family: var(--mono); font-size: 0.68rem; color: var(--muted); }
+
+  main.reading { grid-area: main; overflow-y: auto; padding: 2.4rem clamp(1.25rem, 4vw, 4rem); }
+  .crumbs { font-size: 0.75rem; color: var(--muted); margin-bottom: 0.9rem; }
+  .crumbs button { background: none; border: none; padding: 0; font: inherit; color: var(--ink-soft); cursor: pointer;
+    text-decoration: underline; text-decoration-color: var(--rule); }
+  .crumbs .sep { margin: 0 0.4rem; color: var(--rule); }
+  article h2 { font-family: var(--serif); font-size: clamp(1.4rem, 2.4vw, 1.9rem); font-weight: 600; margin: 0 0 0.3rem; text-wrap: balance; }
+  .meta-line { font-size: 0.76rem; color: var(--muted); margin-bottom: 1.6rem; font-family: var(--mono); }
+  .meta-line b { color: var(--ink-soft); font-weight: 600; }
+  .body-text { max-width: 66ch; font-family: var(--serif); font-size: 1.04rem; line-height: 1.68; }
+  .body-text p { margin: 0 0 1.05em; }
+  .body-text ul { margin: 0 0 1.05em; padding-left: 1.3em; }
+  .body-text li { margin-bottom: 0.4em; }
+  .body-text p.caption { font-family: var(--sans); font-weight: 600; font-size: 0.85rem; color: var(--ink-soft); }
+  .table-scroll { overflow-x: auto; margin: 0 0 1.4em; border: 1px solid var(--rule); border-radius: var(--radius); }
+  .table-scroll table { border-collapse: collapse; font-family: var(--sans); font-size: 0.82rem; width: 100%; }
+  .table-scroll td { border: 1px solid var(--rule); padding: 0.4em 0.6em; vertical-align: top; }
+
+  .footnotes-block { max-width: 66ch; margin-top: 1.8rem; border-top: 1px solid var(--rule); padding-top: 1.1rem; }
+  .footnotes-block .label { font-family: var(--sans); font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.08em;
+    color: var(--gold); font-weight: 700; margin-bottom: 0.7rem; }
+  .footnotes-block ol { margin: 0; padding-left: 1.3em; font-family: var(--serif); font-size: 0.94rem; line-height: 1.55; }
+  .footnotes-block li { margin-bottom: 0.85em; }
+  .shared-with { display: block; margin-top: 0.3em; font-family: var(--sans); font-size: 0.72rem; color: var(--muted); }
+  .shared-with button { background: var(--gold-soft); border: none; color: var(--gold); font: inherit; font-weight: 600;
+    padding: 0.08em 0.5em; border-radius: 999px; cursor: pointer; margin: 0 0.15em; }
+
+  aside.meta { grid-area: meta; overflow-y: auto; border-left: 1px solid var(--rule); background: var(--paper-raised); padding: 1.5rem 1.25rem; }
+  aside.meta h3 { font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin: 1.6rem 0 0.6rem; font-weight: 700; }
+  aside.meta h3:first-child { margin-top: 0; }
+  .kv { display: grid; grid-template-columns: auto 1fr; gap: 0.35rem 0.6rem; font-size: 0.78rem; font-family: var(--mono); }
+  .kv dt { color: var(--muted); }
+  .kv dd { margin: 0; word-break: break-word; }
+  .chips { display: flex; flex-wrap: wrap; gap: 0.35rem; }
+  .chip { font-family: var(--mono); font-size: 0.68rem; background: var(--paper); border: 1px solid var(--rule);
+    border-radius: 999px; padding: 0.16em 0.6em; color: var(--muted); }
+  .chip.warn { color: var(--gold); border-color: var(--gold); background: var(--gold-soft); }
+  .callout { background: var(--gold-soft); border-left: 3px solid var(--gold); padding: 0.7rem 0.85rem; font-size: 0.76rem;
+    line-height: 1.5; border-radius: 0 var(--radius) var(--radius) 0; color: var(--ink-soft); }
+  .empty-note { color: var(--muted); font-family: var(--sans); font-size: 0.82rem; font-style: italic; }
+</style>
+</head>
+<body>
+
+<div class="upload-screen" id="upload-screen">
+  <h1>Chunk &amp; Knowledge-Graph Viewer</h1>
+  <p>Upload a document (PDF, DOCX, PPTX, XLSX, or image). It's parsed locally with MinerU and split into
+     per-heading chunks with page-scoped footnotes — nothing leaves this machine.</p>
+  <label class="dropzone" id="dropzone">
+    <input type="file" id="file-input" accept=".pdf,.docx,.pptx,.xlsx,.png,.jpg,.jpeg">
+    <div class="icon">⌘</div>
+    <div id="dropzone-text">Drop a file here, or click to choose one</div>
+    <div class="hint">Larger documents can take several minutes to parse</div>
+  </label>
+  <div class="file-picked" id="file-picked"></div>
+  <div class="backend-note" id="backend-note">backend: —</div>
+  <button class="go-btn" id="go-btn" disabled>Parse &amp; chunk</button>
+  <div class="processing" id="processing" style="display:none">
+    <div class="spinner"></div>
+    <div id="processing-msg">Running MinerU…</div>
+    <div class="elapsed" id="elapsed"></div>
+  </div>
+  <div class="error-msg" id="error-msg"></div>
+</div>
+
+<div class="shell" id="shell">
+  <header class="top">
+    <div>
+      <h1 id="doc-title">—</h1>
+      <div class="doc-sub" id="doc-sub">—</div>
+    </div>
+    <div class="stats" id="doc-stats"></div>
+    <button class="new-btn" id="new-btn">Upload another</button>
+  </header>
+  <nav class="tree" id="tree" aria-label="Document outline"></nav>
+  <main class="reading" id="reading"></main>
+  <aside class="meta" id="meta"></aside>
+</div>
+
+<script>
+(function () {
+  const uploadScreen = document.getElementById('upload-screen');
+  const shell = document.getElementById('shell');
+  const dropzone = document.getElementById('dropzone');
+  const fileInput = document.getElementById('file-input');
+  const filePicked = document.getElementById('file-picked');
+  const goBtn = document.getElementById('go-btn');
+  const processing = document.getElementById('processing');
+  const errorMsg = document.getElementById('error-msg');
+  const elapsedEl = document.getElementById('elapsed');
+  let chosenFile = null;
+  let timer = null;
+
+  fetch('/api/backend').then((r) => r.json()).then((d) => {
+    document.getElementById('backend-note').textContent = `backend: ${d.backend}`;
+  }).catch(() => {});
+
+  ['dragover', 'dragleave', 'drop'].forEach((evt) =>
+    dropzone.addEventListener(evt, (e) => {
+      e.preventDefault();
+      dropzone.classList.toggle('drag', evt === 'dragover');
+      if (evt === 'drop' && e.dataTransfer.files.length) pick(e.dataTransfer.files[0]);
+    }));
+  fileInput.addEventListener('change', () => { if (fileInput.files.length) pick(fileInput.files[0]); });
+
+  function pick(file) {
+    chosenFile = file;
+    filePicked.textContent = `${file.name} (${(file.size / 1024).toFixed(0)} KB)`;
+    goBtn.disabled = false;
+    errorMsg.textContent = '';
+  }
+
+  goBtn.addEventListener('click', async () => {
+    if (!chosenFile) return;
+    goBtn.disabled = true;
+    dropzone.style.display = 'none';
+    filePicked.style.display = 'none';
+    errorMsg.textContent = '';
+    processing.style.display = 'flex';
+    const start = Date.now();
+    timer = setInterval(() => {
+      elapsedEl.textContent = `${Math.round((Date.now() - start) / 1000)}s elapsed`;
+    }, 1000);
+
+    const form = new FormData();
+    form.append('file', chosenFile);
+    try {
+      const res = await fetch('/api/chunk', { method: 'POST', body: form });
+      if (!res.ok) throw new Error((await res.json()).detail || `Request failed (${res.status})`);
+      const chunks = await res.json();
+      render(chunks);
+      uploadScreen.style.display = 'none';
+      shell.classList.add('active');
+    } catch (err) {
+      errorMsg.textContent = `Couldn't parse this file: ${err.message}`;
+      dropzone.style.display = '';
+      filePicked.style.display = '';
+      goBtn.disabled = false;
+    } finally {
+      clearInterval(timer);
+      processing.style.display = 'none';
+    }
+  });
+
+  document.getElementById('new-btn').addEventListener('click', () => location.reload());
+
+  // ---- viewer (identical logic to the static demo) ----
+  function render(chunks) {
+    const byId = new Map(chunks.map((c) => [c['@id'], c]));
+    const footnoteOwners = new Map();
+    for (const c of chunks) {
+      for (const f of c.pageFootnotes) {
+        if (!footnoteOwners.has(f)) footnoteOwners.set(f, []);
+        footnoteOwners.get(f).push(c['@id']);
+      }
+    }
+    const root = chunks.find((c) => c.level === 0);
+    const totalFootnotes = new Set(chunks.flatMap((c) => c.pageFootnotes)).size;
+    const totalPages = 1 + Math.max(0, ...chunks.map((c) => c.position.pageEnd));
+    const sharedFootnoteCount = [...footnoteOwners.values()].filter((v) => v.length > 1).length;
+
+    document.getElementById('doc-title').textContent = root.sourceFile;
+    document.getElementById('doc-sub').textContent = `doc_id "${root['@id'].split(':')[2]}"`;
+    const stat = (label, value) => `<div class="stat"><b>${value}</b><span>${label}</span></div>`;
+    document.getElementById('doc-stats').innerHTML =
+      stat('chunks', chunks.length) + stat('pages', totalPages) +
+      stat('footnotes', totalFootnotes) + stat('page-shared', sharedFootnoteCount);
+
+    const treeEl = document.getElementById('tree');
+    function nodeHtml(c, depth) {
+      const hasFn = c.pageFootnotes.length > 0;
+      const label = `
+        <span class="node" data-id="${c['@id']}">
+          ${hasFn ? '<span class="dot" title="carries page footnotes"></span>' : ''}
+          <span class="label">${escapeHtml(c.name)}</span>
+          <span class="order">#${c.order}</span>
+        </span>`;
+      if (c.children.length === 0) return `<div class="leaf">${label}</div>`;
+      const open = depth < 1 ? ' open' : '';
+      const kids = c.children.map((id) => nodeHtml(byId.get(id), depth + 1)).join('');
+      return `<details${open}><summary>${label}</summary>${kids}</details>`;
+    }
+    treeEl.innerHTML = nodeHtml(root, 0);
+    treeEl.addEventListener('click', (e) => {
+      const n = e.target.closest('.node');
+      if (!n) return;
+      // A .node sits inside its own <summary> whenever it has children —
+      // without this, the browser's native <details> toggle (fired on any
+      // summary click) races the select() call below, which force-opens the
+      // path to the clicked node: select() runs first and sets open=true,
+      // then the native toggle flips it right back to closed. Selecting a
+      // node should always reveal it, never collapse it out from under you.
+      e.preventDefault();
+      select(n.dataset.id);
+    });
+
+    function renderBodyBlock(block) {
+      const t = block.trim();
+      if (t.startsWith('<table')) return `<div class="table-scroll">${t}</div>`;
+      if (t === '**Footnotes**') return '';
+      if (/^-\s/.test(t)) {
+        const items = t.split('\n').map((l) => `<li>${inline(l.replace(/^-\s*/, ''))}</li>`).join('');
+        return `<ul>${items}</ul>`;
+      }
+      if (/^\*\*[^*]+\*\*$/.test(t)) return `<p class="caption">${escapeHtml(t.slice(2, -2))}</p>`;
+      return `<p>${inline(t)}</p>`;
+    }
+    function inline(s) {
+      let e = escapeHtml(s);
+      e = e.replace(/&lt;(\/?su[pb])&gt;/g, '<$1>');
+      e = e.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+      return e;
+    }
+    function escapeHtml(s) {
+      return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    }
+
+    const readingEl = document.getElementById('reading');
+    const metaEl = document.getElementById('meta');
+
+    function select(id) {
+      const c = byId.get(id);
+      // c.body already has the "**Footnotes**" bullet list appended (that's
+      // the correct, single copy for the exported .md file) — the footnotes
+      // panel below renders c.pageFootnotes separately (with "also attached
+      // to" cross-links), so stop here or that same list renders twice.
+      const rawBlocks = c.body.split(/\n\n+/);
+      const fnMarker = rawBlocks.indexOf('**Footnotes**');
+      const ownBlocks = fnMarker === -1 ? rawBlocks : rawBlocks.slice(0, fnMarker);
+      const bodyBlocks = ownBlocks.map(renderBodyBlock).filter(Boolean).join('\n');
+
+      readingEl.innerHTML = `
+        <div class="crumbs">${c.breadcrumb.map((t, i) => i === c.breadcrumb.length - 1
+          ? `<span>${escapeHtml(t)}</span>`
+          : `<button data-crumb="${c.breadcrumb.slice(0, i + 1).join('|')}">${escapeHtml(t)}</button><span class="sep">/</span>`
+        ).join('')}</div>
+        <article>
+          <h2>${escapeHtml(c.name)}</h2>
+          <div class="meta-line"><b>${c['@id']}</b> · level ${c.level} · pages ${c.position.pageStart}–${c.position.pageEnd}</div>
+          <div class="body-text">${bodyBlocks || '<p class="empty-note">No content blocks — heading only.</p>'}</div>
+          ${c.pageFootnotes.length ? `
+            <div class="footnotes-block">
+              <div class="label">Footnotes — page ${c.position.pageStart}${c.position.pageEnd !== c.position.pageStart ? '–' + c.position.pageEnd : ''}</div>
+              <ol>${c.pageFootnotes.map((f) => {
+                const others = footnoteOwners.get(f).filter((oid) => oid !== id);
+                return `<li>${inline(f)}${others.length ? `<span class="shared-with">also attached to: ${
+                  others.map((oid) => `<button data-jump="${oid}">${escapeHtml(byId.get(oid).name)}</button>`).join('')
+                }(same page)</span>` : ''}</li>`;
+              }).join('')}</ol>
+            </div>` : ''}
+        </article>`;
+
+      readingEl.querySelectorAll('[data-jump]').forEach((btn) => btn.addEventListener('click', () => select(btn.dataset.jump)));
+      readingEl.querySelectorAll('[data-crumb]').forEach((btn) =>
+        btn.addEventListener('click', () => {
+          const names = btn.dataset.crumb.split('|');
+          const target = chunks.find((x) => x.breadcrumb.join('|') === btn.dataset.crumb) ||
+                          chunks.find((x) => x.name === names[names.length - 1]);
+          if (target) select(target['@id']);
+        }));
+
+      metaEl.innerHTML = `
+        <h3>Knowledge-graph entity</h3>
+        <dl class="kv">
+          <dt>@type</dt><dd>${c['@type'].join(', ')}</dd>
+          <dt>order</dt><dd>${c.order}</dd>
+          <dt>parent</dt><dd>${c.parent ? `<button class="chip" style="cursor:pointer" data-jump-meta="${c.parent}">${c.parent.split(':').pop()}</button>` : '—'}</dd>
+          <dt>children</dt><dd>${c.children.length}</dd>
+        </dl>
+        <h3>Content types</h3>
+        <div class="chips">${c.contentTypes.length ? c.contentTypes.map((t) =>
+          `<span class="chip${['header', 'footer', 'page_number'].includes(t) ? ' warn' : ''}">${t}</span>`).join('') : '<span class="empty-note">none</span>'}</div>
+        <h3>Page notes <span style="text-transform:none;font-weight:400">(metadata only)</span></h3>
+        ${c.pageNotes.length ? `<div class="callout">${[...new Set(c.pageNotes)].map(escapeHtml).join('<br>')}</div>` : '<span class="empty-note">none on this page</span>'}
+        <h3>Breadcrumb</h3>
+        <div class="kv" style="grid-template-columns: 1fr;">${c.breadcrumb.map((t) => `<dd>${escapeHtml(t)}</dd>`).join('')}</div>
+      `;
+      const jm = metaEl.querySelector('[data-jump-meta]');
+      if (jm) jm.addEventListener('click', () => select(jm.dataset.jumpMeta));
+
+      treeEl.querySelectorAll('.node').forEach((n) => n.classList.toggle('active', n.dataset.id === id));
+      const activeNode = treeEl.querySelector('.node.active');
+      if (activeNode) {
+        let d = activeNode.closest('details');
+        while (d) { d.open = true; d = d.parentElement.closest('details'); }
+        activeNode.scrollIntoView({ block: 'nearest' });
+      }
+    }
+
+    select(root.children[0] ? root.children[0] : root['@id']);
+  }
+})();
+</script>
+</body>
+</html>

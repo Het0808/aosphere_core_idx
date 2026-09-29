@@ -1,0 +1,42 @@
+.venv/
+.env
+__pycache__/
+*.pyc
+.ruff_cache/
+*.egg-info/
+model-cache/
+
+# Index artifacts are NOT committed. They are published to the per-environment
+# S3 bucket (via `aci publish` with an SSO login) and delivered to the container
+# through a /data volume mount — not git, not baked into the image.
+data/
+data-*/
+*.log
+RAG-json_docx_v1_2026-06-30/
+All_Alerts_json_v1_2026-07-01/
+# local-only compose override (dev creds + keycloak wiring for local runs)
+docker-compose.override.yml
+docker-compose.docgallery.yml
+docker-compose.docgallery-local.yml
+.mineru_pilot
+data-privacy-uk-april-2026/
+data-privacy-germany-may-2026/
+out/
+
+# mineru-gradio demo's own scratch output (parse result bundles) — not project data
+output/
+.mineru_pilot
+
+# local-only test stacks + office lock files
+docker-compose.hybrid.yml
+docker-compose.legacy.yml
+~$*
+data-all-produc-samples/
+.DS_Store
+corpus-src/
+124_Marketing_Restrictions_-_Asset_Management/
+Advanced_Search_All_18082026/
+
+# maudlin/checkup (scripts/checkup.sh) — pinned clone + scan output
+.cache/checkup/
+checkup-out/

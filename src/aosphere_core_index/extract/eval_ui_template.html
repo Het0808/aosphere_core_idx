@@ -1,0 +1,335 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Chunker Eval — MinerU vs legacy</title>
+<style>
+ :root{--ink:#181919;--muted:#5b6472;--line:#EAEDED;--rule:#D4D9D9;--surface:#fff;--bg:#F7F8F9;
+   --mineru:#1f7a72;--mineru-bg:#d9ede9;--legacy:#9c6f1e;--legacy-bg:#f3e6cc;--win:#15803d;--lose:#b0392f;
+   --hybrid:#4457c9;--hybrid-bg:#dfe3f7;
+   --accent:#181919;--radius:11px;--shadow:0 1px 2px rgba(24,25,25,.06),0 4px 16px rgba(24,25,25,.06);
+   --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;--mono:ui-monospace,Menlo,Consolas,monospace;}
+ @media (prefers-color-scheme:dark){:root{--ink:#dfe6f5;--muted:#99a2b1;--line:#242832;--rule:#313644;
+   --surface:#1b1e26;--bg:#14161b;--mineru:#3fa79b;--mineru-bg:#15302c;--legacy:#d9ac5c;--legacy-bg:#3a2f1a;
+   --hybrid:#8b96e8;--hybrid-bg:#242a4a;}}
+ *{box-sizing:border-box} html,body{margin:0;height:100%}
+ body{font-family:var(--sans);color:var(--ink);background:var(--bg);-webkit-font-smoothing:antialiased}
+ header{padding:16px 26px;border-bottom:1px solid var(--rule);background:var(--surface)}
+ header h1{font-size:1.15rem;margin:0} header .sub{color:var(--muted);font-size:.82rem;margin-top:2px}
+ main{max-width:1180px;margin:0 auto;padding:22px 26px 80px}
+ .card{background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);box-shadow:var(--shadow);padding:20px 22px;margin-bottom:18px}
+ .entry{border:1px solid var(--rule);box-shadow:none;padding:16px 18px;margin-bottom:14px;position:relative}
+ .row{display:flex;gap:16px;flex-wrap:wrap;align-items:flex-end}
+ label{display:block;font-size:.72rem;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);font-weight:700;margin-bottom:5px}
+ select,input[type=number]{font-family:inherit;font-size:.9rem;padding:.5rem .6rem;border:1px solid var(--rule);border-radius:8px;background:var(--bg);color:var(--ink)}
+ .drop{border:2px dashed var(--rule);border-radius:9px;padding:12px 14px;background:var(--bg);cursor:pointer;min-width:240px;flex:1}
+ .drop.has{border-color:var(--mineru);background:var(--mineru-bg)} .drop.legacy.has{border-color:var(--legacy);background:var(--legacy-bg)}
+ .drop input{display:none} .drop .t{font-weight:650;font-size:.88rem} .drop .f{font-family:var(--mono);font-size:.74rem;color:var(--muted);margin-top:4px;word-break:break-all}
+ .rm{margin-left:auto;background:none;border:1px solid var(--rule);color:var(--muted);border-radius:8px;width:30px;height:30px;cursor:pointer;font-size:.9rem}
+ .rm:hover{color:var(--lose);border-color:var(--lose)}
+ .addbtn{background:none;border:1px dashed var(--rule);color:var(--muted);padding:.55rem 1rem;border-radius:8px;font-size:.85rem;font-weight:650;cursor:pointer}
+ .addbtn:hover{color:var(--ink);border-color:var(--ink)}
+ .go{margin-top:6px;background:var(--accent);color:#fff;border:none;padding:.7rem 1.8rem;border-radius:999px;font-size:.9rem;font-weight:650;cursor:pointer}
+ .go:disabled{opacity:.4;cursor:not-allowed}
+ .toolbar{display:flex;gap:16px;align-items:flex-end;margin-top:6px;flex-wrap:wrap}
+ .hint{font-size:.78rem;color:var(--muted);margin-top:8px;line-height:1.5}
+ .proc{display:none;align-items:center;gap:12px;margin-top:16px}
+ .spin{width:22px;height:22px;border-radius:50%;border:3px solid var(--rule);border-top-color:var(--mineru);animation:s .9s linear infinite}
+ @keyframes s{to{transform:rotate(360deg)}} .proc .m{font-size:.85rem;color:var(--muted)}
+ .err{color:var(--lose);font-size:.85rem;white-space:pre-wrap;font-family:var(--mono)}
+ h2{font-size:1rem;margin:0 0 12px} h3{font-size:.85rem;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);margin:0 0 8px}
+ .scroll{overflow-x:auto}
+ table{width:100%;border-collapse:collapse;font-size:.85rem}
+ th,td{text-align:left;padding:.45rem .55rem;border-bottom:1px solid var(--line);white-space:nowrap}
+ th{font-size:.66rem;text-transform:uppercase;letter-spacing:.05em;color:var(--muted)}
+ td.num{font-variant-numeric:tabular-nums;text-align:right}
+ tr.delta td{border-top:2px solid var(--rule);font-weight:650}
+ .arm{font-weight:700} .arm.mineru{color:var(--mineru)} .arm.legacy{color:var(--legacy)} .arm.hybrid{color:var(--hybrid)}
+ .drop.hybrid.has{border-color:var(--hybrid);background:var(--hybrid-bg)}
+ .win{color:var(--win);font-weight:700} .lose{color:var(--lose)}
+ .grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px} @media(max-width:760px){.grid2{grid-template-columns:1fr}}
+ .kv{font-family:var(--mono);font-size:.78rem;color:var(--muted)} .kv b{color:var(--ink)}
+ .qrow{font-size:.8rem;padding:.4rem .6rem;border-bottom:1px solid var(--line);white-space:normal}
+ .qrow .exp{font-family:var(--mono);font-size:.72rem}
+ .tag{font-family:var(--mono);font-size:.68rem;padding:.05em .45em;border-radius:5px;background:var(--line);margin-left:4px}
+ .verdict{font-size:1.05rem;font-weight:700;margin:2px 0 12px}
+ details{margin-top:10px} summary{cursor:pointer;font-size:.82rem;color:var(--muted);font-weight:600}
+ td.exp{font-family:var(--mono);font-size:.72rem}
+</style>
+</head>
+<body>
+<header><h1>Chunker Eval — hybrid (pdf2mdtree) vs legacy (DOCX) vs MinerU (PDF)</h1>
+  <div class="sub">Add one or more jurisdictions. Pick a hybrid tree already on disk (this session's pdf2mdtree/hybrid_extract pipeline output) and/or upload a DOCX for legacy and/or a PDF for raw MinerU. All arms present are chunked/loaded, indexed with one shared local embedder, and scored on that region's gold cases — then pooled into an overall hit@1…40 score.</div></header>
+<main>
+  <div class="card" id="form">
+    <div id="entries"></div>
+    <div class="toolbar">
+      <button class="addbtn" id="add">+ Add jurisdiction</button>
+      <div><label>Synth Q/clause</label><input type="number" id="synth" value="0" min="0" max="8" style="width:80px" title="synthetic questions per clause (needs Bedrock; 0=off)"></div>
+      <button class="go" id="go" disabled>Run evaluation</button>
+    </div>
+    <div class="hint">Each jurisdiction's two files should be the <b>same memo</b>. Scoring goes to <b>top-40</b> so hit@1/5/10/15/20/25/30/40 all come from one retrieval. MinerU on a PDF takes a few minutes per file (hybrid·medium) and jurisdictions run one at a time. Gold-case scoring is offline (bge); synthetic questions need Bedrock.</div>
+    <div class="proc" id="proc"><div class="spin"></div><div class="m" id="msg">Running…</div><div class="m" id="el"></div></div>
+    <div class="err" id="err"></div>
+  </div>
+  <div id="overallOut"></div>
+  <div id="out"></div>
+</main>
+<script>
+(function(){
+ const $=id=>document.getElementById(id), esc=s=>String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;');
+ let REGIONS=[], HYBRID_DIRS=[], timer=null, seq=0;
+ const DECISION_K=10; // top-k used for "disagreements" and the plain-English verdict
+
+ Promise.all([
+   fetch('/api/eval/regions').then(r=>r.json()),
+   fetch('/api/eval/hybrid-dirs').then(r=>r.json()),
+ ]).then(([rs,hd])=>{REGIONS=rs; HYBRID_DIRS=hd; addEntry();});
+ $('add').onclick=addEntry;
+
+ function addEntry(){
+   const id='e'+(++seq);
+   const div=document.createElement('div'); div.className='entry card'; div.dataset.id=id;
+   div.innerHTML=`
+     <div class="row">
+       <div><label>Product</label><select class="e-product"></select></div>
+       <div><label>Jurisdiction (gold cases)</label><select class="e-jur" style="min-width:240px"></select></div>
+       <button class="rm" title="remove jurisdiction">✕</button>
+     </div>
+     <div class="row" style="margin-top:12px">
+       <div style="min-width:260px;flex:1">
+         <label>🧩 Hybrid tree (pdf2mdtree, already on disk)</label>
+         <select class="e-hybrid" style="width:100%"><option value="">— none —</option></select>
+       </div>
+       <label class="drop hybrid e-dhpdf"><input type="file" class="e-hpdf" accept=".pdf">
+         <div class="t">🧩 PDF → hybrid (run live)</div><div class="f e-fhpdf">drop / choose the PDF — runs the full 3-stage pipeline, can take minutes</div></label>
+       <label class="drop mineru e-dpdf"><input type="file" class="e-pdf" accept=".pdf">
+         <div class="t">📄 PDF → MinerU</div><div class="f e-fpdf">drop / choose the PDF</div></label>
+       <label class="drop legacy e-ddocx"><input type="file" class="e-docx" accept=".docx">
+         <div class="t">📝 DOCX → legacy</div><div class="f e-fdocx">drop / choose the DOCX</div></label>
+     </div>`;
+   $('entries').appendChild(div);
+   const prods=[...new Set(REGIONS.map(r=>r.product))];
+   const psel=div.querySelector('.e-product');
+   psel.innerHTML=prods.map(p=>`<option>${esc(p)}</option>`).join('');
+   const fillJur=()=>{const p=psel.value; const js=REGIONS.filter(r=>r.product===p).sort((a,b)=>b.cases-a.cases);
+     div.querySelector('.e-jur').innerHTML=js.map(j=>`<option value="${esc(j.jurisdiction)}">${esc(j.jurisdiction)} — ${j.cases} cases</option>`).join('');
+     fillHybrid();};
+   const fillHybrid=()=>{const j=div.querySelector('.e-jur').value; const hsel=div.querySelector('.e-hybrid');
+     const matches=HYBRID_DIRS.filter(h=>h.jurisdiction&&j&&h.jurisdiction.toLowerCase().includes(j.toLowerCase()));
+     const shown=matches.length?matches:HYBRID_DIRS; // no jurisdiction match -> offer everything, let the user pick
+     hsel.innerHTML='<option value="">— none —</option>'+shown.map(h=>`<option value="${esc(h.path)}">${esc(h.label)}</option>`).join('');};
+   psel.onchange=fillJur; fillJur();
+   div.querySelector('.e-jur').onchange=fillHybrid;
+   const wire=(inp,fspan,drop)=>inp.addEventListener('change',()=>{const f=inp.files[0]; if(!f)return;
+     fspan.textContent=`${f.name} (${(f.size/1024).toFixed(0)} KB)`; drop.classList.add('has'); ready();});
+   wire(div.querySelector('.e-pdf'),div.querySelector('.e-fpdf'),div.querySelector('.e-dpdf'));
+   wire(div.querySelector('.e-docx'),div.querySelector('.e-fdocx'),div.querySelector('.e-ddocx'));
+   // uploading a PDF here means "run the pipeline live" — it wins over the dropdown, so
+   // disable + grey the dropdown instead of leaving two contradictory hybrid sources armed.
+   const hsel=div.querySelector('.e-hybrid');
+   wire(div.querySelector('.e-hpdf'),div.querySelector('.e-fhpdf'),div.querySelector('.e-dhpdf'));
+   div.querySelector('.e-hpdf').addEventListener('change',()=>{
+     const has=!!div.querySelector('.e-hpdf').files[0]; hsel.disabled=has; if(has) hsel.value='';});
+   hsel.addEventListener('change',ready);
+   div.querySelector('.rm').onclick=()=>{div.remove(); ready();};
+   ready();
+ }
+
+ function entries(){
+   return [...document.querySelectorAll('.entry')].map(div=>({
+     product:div.querySelector('.e-product').value,
+     jurisdiction:div.querySelector('.e-jur').value,
+     pdf:div.querySelector('.e-pdf').files[0]||null,
+     docx:div.querySelector('.e-docx').files[0]||null,
+     hybridPdf:div.querySelector('.e-hpdf').files[0]||null,
+     hybridDir:div.querySelector('.e-hybrid').value||null,
+   }));
+ }
+ function ready(){ $('go').disabled=!entries().some(e=>e.pdf||e.docx||e.hybridDir||e.hybridPdf); }
+
+ $('go').onclick=async()=>{
+   const list=entries().filter(e=>e.pdf||e.docx||e.hybridDir||e.hybridPdf);
+   if(!list.length) return;
+   $('go').disabled=true; $('err').textContent=''; $('out').innerHTML=''; $('overallOut').innerHTML='';
+   $('proc').style.display='flex';
+   const t0=Date.now(); timer=setInterval(()=>$('el').textContent=`${Math.round((Date.now()-t0)/1000)}s`,1000);
+   const reports=[]; const errs=[];
+   for(let i=0;i<list.length;i++){
+     const e=list[i];
+     const slow=e.pdf||e.hybridPdf;
+     $('msg').textContent=`Jurisdiction ${i+1}/${list.length}: ${e.jurisdiction} — ${slow?'chunking (MinerU can take minutes)…':'chunking…'}`;
+     const fd=new FormData();
+     fd.append('product',e.product); fd.append('jurisdiction',e.jurisdiction); fd.append('synth',$('synth').value);
+     if(e.pdf) fd.append('pdf',e.pdf); if(e.docx) fd.append('docx',e.docx);
+     if(e.hybridPdf) fd.append('hybrid_pdf',e.hybridPdf);
+     else if(e.hybridDir) fd.append('hybrid_dir',e.hybridDir);
+     try{
+       const r=await fetch('/api/eval',{method:'POST',body:fd});
+       const d=await r.json();
+       if(!r.ok||d.error){ errs.push(`${e.jurisdiction}: ${(d.error||('HTTP '+r.status))}`); }
+       else{ reports.push(d); $('out').insertAdjacentHTML('beforeend',reportCard(d)); }
+     }catch(ex){ errs.push(`${e.jurisdiction}: ${ex.message}`); }
+   }
+   clearInterval(timer); $('proc').style.display='none'; $('go').disabled=false;
+   if(errs.length) $('err').textContent=errs.join('\n');
+   if(reports.length) $('overallOut').innerHTML=overallCard(reports);
+ };
+
+ // ---------- helpers ----------
+ const arms=d=>Object.keys(d.trees||{});
+ const cls=n=>n.startsWith('mineru')?'mineru':n.startsWith('hybrid')?'hybrid':'legacy';
+ const fmtLvl=v=>v+'%';
+ // family match, mirroring eval_cases._nk / hit_ok  ("H1.6(a)" -> "H1.6.a")
+ const nk=k=>String(k).replaceAll('(','.').replaceAll(')','').replace(/^\.+|\.+$/g,'');
+ const isHit=(key,exps)=>{const n=nk(key);return (exps||[]).some(e=>{const ne=nk(e);return n===ne||n.startsWith(ne+'.')||ne.startsWith(n+'.');});};
+ const topHtml=(top,exp)=>(top||[]).map(kk=>isHit(kk,exp)?`<b class="win">${esc(kk)}</b>`:esc(kk)).join(', ')||'—';
+
+ // pool rows across reports -> agg, mirroring chunk_eval.agg
+ function aggRows(rows,levels){
+   const n=rows.length||1;
+   const at=(field,kk)=>Math.round(100*rows.filter(r=>r[field]>=0&&r[field]<kk).length/n);
+   const out={n:rows.length,
+     MRR:+(rows.filter(r=>r.rank>=0).reduce((s,r)=>s+1/(r.rank+1),0)/n).toFixed(3),
+     key_coverage:Math.round(100*rows.filter(r=>r.key_present).length/n)};
+   levels.forEach(L=>out['hit@'+L]=at('rank',L));
+   return out;
+ }
+ // order arms legacy first, then hybrid, then mineru — Δ (2-arm case) reads as (arm2 − legacy)
+ function ordered(sec){const o={}; ['legacy(docx)','hybrid(pdf2mdtree)','mineru(pdf)'].forEach(n=>{if(sec[n])o[n]=sec[n];});
+   Object.keys(sec).forEach(n=>{if(!o[n])o[n]=sec[n];}); return o;}
+
+ function metricTable(secRaw,levels){
+   const sec=ordered(secRaw), names=Object.keys(sec); if(!names.length) return '';
+   const cols=levels.map(L=>['hit@'+L,'hit@'+L]).concat([['MRR','MRR'],['key-cov','key_coverage']]);
+   const best={}; cols.forEach(c=>best[c[1]]=Math.max(...names.map(n=>sec[n].agg[c[1]])));
+   let h=`<div class="scroll"><table><tr><th>Arm</th><th class="num">n</th>${cols.map(c=>`<th class="num">${c[0]}</th>`).join('')}</tr>`;
+   names.forEach(n=>{const a=sec[n].agg;
+     h+=`<tr><td class="arm ${cls(n)}">${esc(n)}</td><td class="num">${a.n}</td>`+
+        cols.map(c=>{const v=a[c[1]]; const w=names.length>1&&v===best[c[1]]&&v>0?' win':'';
+          const disp=c[1]==='MRR'?v.toFixed(3):v+'%';
+          return `<td class="num${w}">${disp}</td>`;}).join('')+`</tr>`;});
+   if(names.length===2){const[x,y]=names;
+     h+=`<tr class="delta"><td class="arm">Δ (${esc(y)}−${esc(x)})</td><td class="num">—</td>`+
+        cols.map(c=>{const dv=+(sec[y].agg[c[1]]-sec[x].agg[c[1]]).toFixed(3);
+          const disp=c[1]==='MRR'?(dv>0?'+':'')+dv.toFixed(3):(dv>0?'+':'')+dv+'pts';
+          return `<td class="num ${dv>0?'win':dv<0?'lose':''}">${disp}</td>`;}).join('')+`</tr>`;}
+   h+='</table></div>'; return h;
+ }
+
+ function armCell(row,k){
+   const hit=row.rank>=0&&row.rank<k;
+   const badge=hit?`<span class="win">✓ #${row.rank+1}</span>`:`<span class="lose">✗ miss</span>`;
+   return `${badge}<div class="kv" style="margin-top:3px">${topHtml(row.top,row.expected)}</div>`;
+ }
+ function perQuestion(sec,k){
+   const names=Object.keys(sec); if(!names.length) return '';
+   const rows=sec[names[0]].rows;
+   let h=`<details><summary>Per-question detail — all ${rows.length} questions (expected vs what each arm retrieved)</summary>`;
+   h+=`<div style="max-height:520px;overflow:auto;margin-top:10px"><table>`;
+   h+=`<tr><th>#</th><th>Question</th><th>Expected</th>${names.map(n=>`<th class="arm ${cls(n)}">${esc(n)} — ✓rank / top-8 keys</th>`).join('')}</tr>`;
+   rows.forEach((r,i)=>{
+     h+=`<tr><td class="num">${i+1}</td><td>${esc(r.q).slice(0,120)}</td><td class="exp">${esc((r.expected||[]).join(', '))}</td>`;
+     names.forEach(n=>{h+=`<td>${armCell(sec[n].rows[i],k)}</td>`;});
+     h+=`</tr>`;
+   });
+   h+=`</table></div></details>`;
+   return h;
+ }
+ function disagreements(sec,k){
+   const names=Object.keys(ordered(sec)); if(names.length!==2) return '';
+   const on=ordered(sec), a=names[0], b=names[1], ra=on[a].rows, rb=on[b].rows;
+   const inTop=r=>r.rank>=0&&r.rank<k;
+   const rows=[];
+   for(let i=0;i<ra.length;i++){const A=ra[i],B=rb[i]; if(inTop(A)!==inTop(B)){
+     rows.push({q:A.q,exp:A.expected.join(', '),aw:inTop(A),bw:inTop(B)});}}
+   if(!rows.length) return `<div class="hint">No per-question disagreements within top-${k}.</div>`;
+   const wa=rows.filter(r=>r.aw).length, wb=rows.filter(r=>r.bw).length;
+   let h=`<details open><summary>${rows.length} questions where the arms disagree within top-${k} — ${esc(a)} wins ${wa}, ${esc(b)} wins ${wb}</summary>`;
+   const tag=n=>({mineru:'M',hybrid:'H',legacy:'L'}[cls(n)]);
+   rows.slice(0,50).forEach(r=>{h+=`<div class="qrow"><span class="${r.aw?'win':'lose'}">${tag(a)}${r.aw?'✓':'✗'}</span> <span class="${r.bw?'win':'lose'}">${tag(b)}${r.bw?'✓':'✗'}</span> ${esc(r.q).slice(0,90)} <span class="exp">→ ${esc(r.exp)}</span></div>`;});
+   h+='</details>'; return h;
+ }
+
+ // plain-English winner at the decision level, so the user can judge switchover
+ function verdict(sec,levels){
+   const on=ordered(sec), names=Object.keys(on); if(names.length!==2) return '';
+   const [x,y]=names; const L='hit@'+(levels.includes(DECISION_K)?DECISION_K:levels[0]);
+   const dv=on[y].agg[L]-on[x].agg[L], dm=on[y].agg.MRR-on[x].agg.MRR;
+   const better=dv>0?y:dv<0?x:null;
+   const txt=better? `${esc(better)} retrieves the right clause more often (${L.replace('hit@','hit@')} ${dv>0?'+':''}${dv} pts, MRR ${dm>0?'+':''}${dm.toFixed(3)} in mineru−legacy terms).`
+                    : `Dead heat at ${L} (Δ MRR ${dm>0?'+':''}${dm.toFixed(3)}).`;
+   const cl=better===null?'':cls(better);
+   return `<div class="verdict"><span class="${cl?'arm '+cl:''}">${better?('▲ '+esc(better)):'≈ tie'}</span> <span style="font-weight:400;color:var(--muted);font-size:.85rem">— ${txt}</span></div>`;
+ }
+
+ // ---------- overall (pooled across jurisdictions) ----------
+ function overallCard(reports){
+   const levels=reports[0].levels||[1,5,10,15,20,25,30,40];
+   const withGold=reports.filter(r=>r.gold&&Object.keys(r.gold).length);
+   if(!withGold.length) return '';
+   const armNames=[...new Set(withGold.flatMap(r=>Object.keys(r.gold)))];
+   const sec={};
+   armNames.forEach(n=>{const rows=withGold.filter(r=>r.gold[n]).flatMap(r=>r.gold[n].rows);
+     sec[n]={agg:aggRows(rows,levels),rows};});
+   const nQ=Object.values(ordered(sec))[0].agg.n;
+   let h=`<div class="card" id="overall" style="border-color:var(--rule)"><h2>★ Overall — pooled across ${withGold.length} jurisdiction${withGold.length>1?'s':''} <span class="tag">${nQ} gold questions</span></h2>`;
+   h+=verdict(sec,levels);
+   h+=metricTable(sec,levels);
+   h+=`<div class="hint">Every gold question from all jurisdictions is scored against its own document's index, then pooled — this answers "across the board, which chunking finds the right clause more often, and by how much." The <b>Δ row</b> is <b>mineru − legacy</b>: <span class="win">green/+</span> means MinerU is worth switching to at that depth; <span class="lose">red/−</span> means legacy still wins. Read across the levels — a switchover is safe when Δ is positive at the depth your retriever actually uses (often hit@5–hit@10).</div>`;
+   h+=perJurMatrix(withGold,levels);
+   h+='</div>';
+   return h;
+ }
+ function perJurMatrix(reports,levels){
+   const L='hit@'+(levels.includes(DECISION_K)?DECISION_K:levels[0]);
+   const armNames=[...new Set(reports.flatMap(r=>Object.keys(ordered(r.gold))))];
+   let h=`<h3 style="margin-top:18px">Per-jurisdiction consistency (${L} / MRR)</h3><div class="scroll"><table>
+     <tr><th>Jurisdiction</th><th class="num">n</th>${armNames.map(n=>`<th class="num arm ${cls(n)}">${esc(n)} ${L}</th>`).join('')}
+     ${armNames.length===2?`<th class="num">Δ ${L}</th>`:''}
+     ${armNames.map(n=>`<th class="num arm ${cls(n)}">${esc(n)} MRR</th>`).join('')}</tr>`;
+   reports.forEach(r=>{const g=ordered(r.gold);
+     const hits=armNames.map(n=>g[n]?g[n].agg[L]:null);
+     const n0=armNames.map(n=>g[n]).find(Boolean);
+     h+=`<tr><td>${esc(r.jurisdiction)}</td><td class="num">${n0?n0.agg.n:'—'}</td>`+
+        hits.map(v=>`<td class="num">${v!=null?v+'%':'—'}</td>`).join('');
+     if(armNames.length===2){const d=(hits[0]!=null&&hits[1]!=null)?hits[1]-hits[0]:null;
+       h+=`<td class="num ${d>0?'win':d<0?'lose':''}">${d!=null?(d>0?'+':'')+d+'pts':'—'}</td>`;}
+     h+=armNames.map(n=>`<td class="num">${g[n]?g[n].agg.MRR.toFixed(3):'—'}</td>`).join('')+`</tr>`;});
+   h+='</table></div>'; return h;
+ }
+
+ // ---------- per-jurisdiction card ----------
+ function reportCard(d){
+   const levels=d.levels||[1,5,10,15,20,25,30,40];
+   const mineruTag=d.mineru_backend?` · MinerU <b>${esc(d.mineru_backend)}${d.mineru_effort?'/'+esc(d.mineru_effort):''}</b>`:'';
+   let h=`<div class="card"><h2>${esc(d.product)} · ${esc(d.jurisdiction)}</h2>
+     <div class="kv">embedder <b>${esc(d.embedder)}</b> · scored to top-<b>${d.k}</b>${mineruTag} · chunk time ${Object.entries(d.timings_s||{}).map(([n,t])=>`${esc(n)} <b>${t}s</b>`).join(' · ')||'—'}</div>`;
+   // trees
+   h+='<div class="grid2" style="margin-top:14px">';
+   arms(d).forEach(n=>{const t=d.trees[n];
+     h+=`<div><h3 class="arm ${cls(n)}">${esc(n)}</h3><div class="kv">sections <b>${t.sections}</b> · footnotes <b>${t.footnotes}</b><br>levels <b>${JSON.stringify(t.levels)}</b><br>top-level <b>${t.top_level_keys.join(', ')}</b></div></div>`;});
+   h+='</div>';
+   // gold
+   if(d.gold&&Object.keys(d.gold).length){
+     h+=`<h3 style="margin-top:18px">Retrieval — gold cases <span class="tag">${Object.values(d.gold)[0].agg.n} questions</span></h3>
+       ${verdict(d.gold,levels)}
+       ${metricTable(d.gold,levels)}
+       <div class="hint" style="margin-top:8px"><b>key-coverage</b> = share of gold clause keys that even exist in that arm's chunk tree (a chunking that produces different keys can't be retrieved — so this bounds hit@k). Below, <b class="win">green bold</b> = a retrieved key matching the expected clause; <span class="win">✓ #n</span> = correct clause at rank n; <span class="lose">✗ miss</span> = not in top-${d.k}.</div>
+       ${disagreements(d.gold,DECISION_K)}
+       ${perQuestion(d.gold,d.k)}`;
+   }
+   // synth
+   if(d.synth&&Object.keys(d.synth).length){
+     h+=`<h3 style="margin-top:18px">Retrieval — synthetic questions</h3><div class="hint" style="margin-bottom:8px">${esc(d.synth_note||'')}</div>${metricTable(d.synth,levels)}${perQuestion(d.synth,d.k)}`;
+   } else if(d.synth_note&&d.synth_note!=='off'){
+     h+=`<div class="hint" style="margin-top:12px">Synthetic: ${esc(d.synth_note)}</div>`;
+   }
+   h+='</div>';
+   return h;
+ }
+})();
+</script>
+</body>
+</html>

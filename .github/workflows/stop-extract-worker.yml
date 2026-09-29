@@ -1,0 +1,167 @@
+# =============================================================================
+# Stop a running GPU corpus extraction.
+#
+# Counterpart to build-extract-image.yml ("Build & Deploy Extract Worker"). That
+# workflow can START a run; without this one, STOPPING it meant raising a PR
+# against k8s-deployment by hand, which a service owner should not have to do.
+#
+# WHAT IT DOES
+#   Sets `enabled: false` in helm-charts/core-index-extract/values-<env>.yaml in
+#   k8s-deployment and pushes. ArgoCD prunes the Job on its next reconcile, the
+#   pods get SIGTERM, and the GPU node group scales back to zero.
+#
+# WHY NOT `kubectl delete job`
+#   The mother chart sets `prune: true, selfHeal: false`. A hand-deleted Job is
+#   not recreated immediately -- but the Application then sits OutOfSync/Missing,
+#   and the NEXT time anyone syncs it the Job comes back and the extraction
+#   restarts. Setting enabled: false makes "stopped" the desired state, so it
+#   stays stopped. It is also the only form of stop that leaves an audit trail.
+#
+# NOTHING IS LOST
+#   The worker uploads each document as it finishes, so everything already
+#   extracted is durable in S3 under corpus/<runId>/. On SIGTERM it stops where it
+#   is -- the document in flight is abandoned rather than finished, its shard
+#   summary is marked `status: interrupted` naming that document, and the pod is
+#   gone within seconds. Only the document in flight is redone, and the resume
+#   does that from S3 without being asked.
+#
+# TO RESUME
+#   Just dispatch "Build & Deploy Extract Worker" with build=false, mode=extract
+#   and run_id BLANK. That workflow sets `enabled: true` itself, so a stop here is
+#   undone by a deploy there -- no hand-editing, and the two are exact opposites.
+#   A blank run_id keeps the existing S3 prefix, so the worker skips every
+#   document that already has a scorecard.json and continues where it stopped.
+#   Setting a NEW run_id would discard that progress and re-extract everything.
+#
+# NOTE ON TIMING
+#   This pushes to git; it does not call ArgoCD. Nothing in this org's CI does --
+#   the library CD workflow also just commits and lets ArgoCD poll (its
+#   "argocd-sync" job is only a Teams notification). Expect the Job to disappear
+#   within a few minutes of this workflow going green, not instantly. If you need
+#   it stopped THIS SECOND, follow up with a manual ArgoCD sync -- but this
+#   workflow is what makes the stop durable, so run it either way.
+# =============================================================================
+name: Stop Extract Worker
+
+run-name: >-
+  STOP extract on ${{ inputs.environment }} | by ${{ github.actor }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        # Must match an environment that has a core-index-extract values file and
+        # is registered in the mother chart. stage1 is the default because that is
+        # where the workload now runs; dev1 is kept so an older run there can still
+        # be stopped.
+        description: "Environment whose extraction run should be stopped"
+        required: true
+        default: stage1
+        type: choice
+        options: [stage1, dev1]
+      confirm:
+        # A full run is hours of GPU time; stopping one by a mis-click is worth
+        # one extra dropdown. Deliberately defaults to "no" so the workflow is a
+        # no-op unless the choice is explicit.
+        description: "Really stop the run? Choose yes."
+        required: true
+        default: "no"
+        type: choice
+        options: ["no", "yes"]
+
+permissions:
+  contents: read
+
+jobs:
+  stop:
+    name: Disable the extraction Job
+    runs-on: corp-internal-arc-runner-ops
+    timeout-minutes: 10
+    steps:
+      - name: Confirmation gate
+        env:
+          CONFIRM: ${{ inputs.confirm }}
+        run: |
+          set -euo pipefail
+          if [ "$CONFIRM" != "yes" ]; then
+            echo "::error::Not confirmed — re-run and set confirm=yes. Nothing was changed."
+            exit 1
+          fi
+
+      - name: Checkout k8s-deployment
+        uses: actions/checkout@v7
+        with:
+          repository: Skandiam/k8s-deployment
+          token: ${{ secrets.RUNNER_ACCESS_TOKEN }}
+          ref: main
+
+      - name: Disable the chart
+        env:
+          VALUES_FILE: helm-charts/core-index-extract/values-${{ inputs.environment }}.yaml
+        run: |
+          set -euo pipefail
+          test -f "$VALUES_FILE" || { echo "::error::$VALUES_FILE not found"; exit 1; }
+
+          if grep -qE '^enabled: false' "$VALUES_FILE"; then
+            echo "already disabled — nothing to do"
+            echo "ALREADY_STOPPED=true" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          sed -i -E 's/^enabled: true/enabled: false/' "$VALUES_FILE"
+          grep -E '^(enabled|shards|runId|args):|^  tag:' "$VALUES_FILE"
+
+      - name: Commit and push
+        if: ${{ env.ALREADY_STOPPED != 'true' }}
+        env:
+          VALUES_FILE: helm-charts/core-index-extract/values-${{ inputs.environment }}.yaml
+          ENVIRONMENT: ${{ inputs.environment }}
+          ACTOR: ${{ github.actor }}
+          GH_USERNAME: ${{ secrets.GH_USERNAME }}
+          GH_EMAIL: ${{ secrets.GH_EMAIL }}
+        run: |
+          set -euo pipefail
+          git config user.name "$GH_USERNAME"
+          git config user.email "$GH_EMAIL"
+          git add "$VALUES_FILE"
+          if git diff --cached --quiet; then
+            echo "no change to commit"
+            exit 0
+          fi
+          git commit -m "[GitHub-Action][$ENVIRONMENT] core-index-extract: STOP requested by $ACTOR - Run ${GITHUB_RUN_ID}"
+          git push origin main
+
+      - name: Summary
+        if: ${{ always() }}
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+        run: |
+          {
+            if [ "${ALREADY_STOPPED:-}" = "true" ]; then
+              echo "### core-index-extract on $ENVIRONMENT was already stopped"
+              echo ""
+              echo "\`enabled\` was already \`false\`. No change made."
+            else
+              echo "### core-index-extract on $ENVIRONMENT — stop requested"
+              echo ""
+              echo "\`enabled: false\` pushed to k8s-deployment \`main\`."
+              echo ""
+              echo "ArgoCD prunes the Job on its next reconcile (a few minutes, not instant)."
+              echo "Workers get SIGTERM and finish the document they are on before exiting,"
+              echo "so the stop is graceful. The GPU node group then scales back to zero."
+            fi
+            echo ""
+            echo "**Nothing extracted so far is lost** — each document is uploaded to S3 as it"
+            echo "completes. Count what is done with:"
+            echo ""
+            echo '```'
+            echo "aws s3 ls --recursive s3://aosphere-tenant-$ENVIRONMENT-core-index/corpus/<runId>/ \\"
+            echo "  | grep scorecard.json | grep -v /fallback/ | wc -l"
+            echo '```'
+            echo ""
+            echo "**To resume:** run *Build & Deploy Extract Worker* with \`build=false\`,"
+            echo "\`mode=extract\` and \`run_id\` **blank**. That workflow re-enables the chart"
+            echo "itself, so nothing needs hand-editing. Blank \`run_id\` keeps the current S3"
+            echo "prefix so finished documents are skipped; a new \`run_id\` re-extracts the"
+            echo "whole corpus."
+          } >> "$GITHUB_STEP_SUMMARY"

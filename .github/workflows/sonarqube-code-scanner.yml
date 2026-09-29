@@ -1,0 +1,24 @@
+name: SonarQube code scanner
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  code-scanner:
+    name: Sonarqube code scanner
+    uses: Skandiam/gh-action-library/.github/workflows/sonarqube-code-scanner.yml@main
+    with:
+      # Python project (no JVM build, no Maven). SonarQube's bundled JS/TS
+      # analyzer shells out to `node -v` before scanning, so the Node runtime
+      # is still needed even though there's no npm install/test. projectKey is
+      # auto-derived from the repo name by the run_sonar_scan path (no
+      # sonar-project.properties required — that's only for run_build_analyze).
+      run_node_setup: true
+      run_maven_cache: false
+      run_sonar_scan: true
+    secrets: inherit

@@ -1,0 +1,130 @@
+# Extraction worker (GPU). Deliberately SEPARATE from ./Dockerfile, which builds the API and
+# frontend: that image must stay small and must not carry several GB of vision models, and this
+# one has no reason to carry uvicorn or serve a port. Nothing here publishes to the index —
+# the worker extracts and scores, and that is all (see scripts/corpus_worker.py).
+#
+# Linux torch wheels on PyPI are CUDA builds, so no special index is needed; the host supplies
+# the driver and the NVIDIA container toolkit supplies the device.
+FROM python:3.12-slim
+
+# Base upgrade patches most CVEs, matching ./Dockerfile. libgl1/libglib2.0-0 are opencv's
+# runtime deps — MinerU imports cv2, which fails at import time without them.
+# gcc is NOT optional here, and its absence is invisible until CUDA is involved. Triton (which
+# torch uses for GPU kernels, and which MinerU's VLM path goes through) JIT-COMPILES a small C
+# file at runtime — /tmp/…/cuda_utils.c — and dies with "Failed to find C compiler" without one.
+# Triton is never invoked on Apple/MPS, so every one of these documents extracts fine on a laptop
+# and fails on every GPU node: measured, five documents that pass locally failed here.
+RUN apt-get update && apt-get upgrade -y \
+    && apt-get install --no-install-recommends -y \
+        libgomp1 liblzma5 libgl1 libglib2.0-0 \
+        gcc libc6-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Name it explicitly rather than relying on Triton's search order.
+ENV CC=gcc
+
+WORKDIR /app
+
+# The pipeline environment. awscli comes in here because the worker shells out to `aws s3 sync`
+# for the per-document upload rather than reimplementing multipart and retries over boto3.
+#
+# pymupdf is installed EXPLICITLY, and it has to be. It lives in the `extract` optional extra
+# in pyproject.toml, deliberately kept out of requirements.txt because the deployed
+# ACI_OFFLINE=1 service reads pre-baked artifacts and never re-parses a document. That reasoning
+# is right for ./Dockerfile — and exactly backwards for this image, which exists to parse PDFs.
+# It cannot come in via the `pip install .` below either: that uses --no-deps, which skips
+# extras as well as dependencies. Without it scripts/pdf2mdtree.py sys.exits at IMPORT
+# ("pymupdf missing"), so the worker dies before printing a line or touching S3 — which is how
+# the first dev1 run failed. Version constraint tracks pyproject's `extract` extra.
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt awscli "pymupdf>=1.24"
+
+# MinerU gets its OWN environment, exactly as the local checkout keeps it (.venv-mineru): it
+# pins torch 2.13 / transformers 4.57, which the pipeline environment must not inherit. The
+# pipeline invokes it as a plain `mineru` on PATH — scripts/run_hybrid_one.py documents the
+# same symlink locally, so the container matches the layout developers already run.
+ENV MINERU_VENV=/opt/venv-mineru
+# `core,lmdeploy`, not bare `core`. MinerU chooses its VLM inference engine by asking what
+# is importable (mineru/utils/engine_utils.py::_select_linux_engine): vllm, else lmdeploy,
+# else `transformers`. `core` is vlm+pipeline+gradio, and `vlm` is only torch+transformers
+# +accelerate -- so with bare `core` every pod silently landed on `transformers`, MinerU's
+# unoptimised reference path. Nothing fails and nothing is logged; it just runs ~5x slower
+# (830s vs 166s for the same 58-page table-dense document, measured on a dev GPU), which on
+# spot capacity also means ~5x the wall-clock in which a node can be reclaimed mid-shard.
+#
+# lmdeploy rather than vllm because this pool spans g4dn/g5/g6 (karpenter-gpu-nodepool.yaml)
+# and these engines carry hand-written CUDA kernels per GPU generation: recent vllm has been
+# dropping the older ones, and g4dn's T4 is compute capability 7.5. lmdeploy covers 7.5-8.9,
+# so the fleet keeps all three instance families -- which that nodepool calls its real
+# interruption defence. Switching to vllm would mean giving up g4dn.
+#
+# No CUDA_PATH needed here: lmdeploy's turbomind bootstrap only demands it under
+# `os.name == 'nt'`. On Linux it also picks its own sub-backend per card -- turbomind on the
+# T4 (<8.0), its pytorch backend on g5/g6 -- and MINERU_LMDEPLOY_BACKEND overrides that if
+# the two are worth timing against each other.
+RUN python -m venv "$MINERU_VENV" \
+    && "$MINERU_VENV/bin/pip" install --no-cache-dir "mineru[core,lmdeploy]==3.4.4" \
+    && ln -sf "$MINERU_VENV/bin/mineru" /usr/local/bin/mineru
+
+# Bake the model weights into the image. Left unbaked, every pod downloads several GB from
+# HuggingFace before its first page, repeats it on every restart, and turns a spot eviction into
+# a re-download. `-m all` (not `-m pipeline`) because config.py defaults mineru_backend to
+# "hybrid-engine", which needs the VLM weights as well as the pipeline ones.
+ENV HF_HOME=/opt/models \
+    MINERU_MODEL_SOURCE=huggingface
+# The downloader records WHERE it put the weights in a config file at $HOME/mineru.json, and that
+# file is how MinerU finds them again: get_local_models_dir() reads it and returns None without it.
+# $HOME at runtime is not guaranteed to be $HOME at build time — a securityContext with runAsUser
+# is enough to change it — and with HF_HUB_OFFLINE=1 an unresolved model is a hard failure rather
+# than a download. So pin the config to a fixed path and point MinerU at it explicitly, and make
+# both readable to any uid the pod may run as.
+RUN "$MINERU_VENV/bin/mineru-models-download" -s huggingface -m all \
+    && cp /root/mineru.json /opt/mineru.json \
+    && chmod -R a+rX /opt/models /opt/mineru.json
+
+ENV MINERU_TOOLS_CONFIG_JSON=/opt/mineru.json \
+    MINERU_MODEL_SOURCE=local
+
+# FAIL THE BUILD if the weights are not resolvable, rather than shipping an image that only
+# discovers it on a GPU node mid-run. This is the check that was missing: the first cluster run
+# extracted 4,213 pages before anyone could tell whether MinerU had its models.
+RUN "$MINERU_VENV/bin/python" -c "\
+from mineru.utils.config_reader import get_local_models_dir; \
+d = get_local_models_dir(); \
+assert d, 'models-dir unresolved: MinerU would try to download at runtime, which HF_HUB_OFFLINE blocks'; \
+import os, json; \
+missing = [k for k, v in (d.items() if isinstance(d, dict) else {'dir': d}.items()) if not os.path.isdir(str(v))]; \
+assert not missing, f'models-dir points at paths that do not exist: {missing}'; \
+print('baked models resolve:', json.dumps(d))"
+
+# Triton compiles at runtime, on a GPU we do not have at build time, so the closest we can get
+# is proving the toolchain it needs is present. A missing compiler otherwise surfaces hours into a
+# cluster run as a MinerU exit code with the reason buried in a pod log.
+RUN cc --version && gcc --version && echo "C toolchain present for triton JIT"
+
+COPY . .
+RUN pip install --no-cache-dir --no-deps .
+
+# Weights are in the image, so refuse to reach HuggingFace at runtime: a worker that silently
+# re-downloads is a worker whose timings are unexplainable.
+# Reclaim allocator fragmentation before adding hardware. Measured on a T4 during run
+# 2026-08-21-02, from the failure log itself:
+#
+#   torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 3.87 GiB. GPU 0 has a total
+#   capacity of 14.74 GiB of which 2.50 GiB is free. Process has 12.24 GiB memory in use. Of the
+#   allocated memory 7.49 GiB is allocated by PyTorch
+#
+# 12.24 GiB in use against 7.49 GiB actually allocated: ~4.75 GiB is reserved-but-unused blocks
+# the caching allocator will not hand back because nothing fits them. expandable_segments lets it
+# grow and reuse one segment instead of stranding many, which is exactly this shape of failure —
+# a large late allocation (the VLM on a table crop) refused while free memory exists in pieces.
+#
+# 22 of the 84 failures in that run were this. If reclaiming the fragmentation covers the 3.87 GiB
+# that allocation wanted, most of them go away for an env var; if it does not, the next run's
+# failure logs say so and the case for a 24GB card is then evidenced rather than assumed.
+ENV PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+ENV HF_HUB_OFFLINE=1 \
+    PYTHONUNBUFFERED=1
+
+ENTRYPOINT ["python", "scripts/corpus_worker.py"]

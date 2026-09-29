@@ -1,0 +1,182 @@
+# GPU extraction workers. 6 pods, each taking a disjoint shard of the corpus, sources pulled
+# from S3 and results pushed back to the same bucket per document.
+#
+# WHY AN INDEXED JOB AND NOT A QUEUE
+# completionMode: Indexed sets JOB_COMPLETION_INDEX in each pod, which corpus_worker.py reads as
+# its shard number. The shard partition is a pure function of the work list (longest documents
+# first onto the least-loaded shard, balanced by PAGES — verified at 4,863–4,864 pages across 6
+# shards on the real corpus), so two pods can never claim the same document and no lease, lock or
+# SQS queue is needed. Balancing by page count rather than document count matters here: documents
+# run 8 to 165 pages, so an even split by count would leave one worker hours behind.
+#
+# RESUME
+# A document is finished when its scorecard.json is in S3. A restarted pod lists those keys back
+# (a few MB, never the ~76 GB of trees) and skips what is already done, so an evicted pod resumes
+# rather than repeating its shard.
+#
+#   kubectl -n aosphere-extraction apply -f deploy/extraction-job.yaml
+#   kubectl -n aosphere-extraction logs -f job/corpus-extract -c worker --max-log-requests 6
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: corpus-extract
+  namespace: aosphere-extraction
+  annotations:
+    # IRSA. STALE as an S3-only claim: this comment used to read "no Bedrock, no OpenSearch,
+    # verified: no bedrock/boto3 import anywhere under pdf2mdtree or the run_corpus chain".
+    # That stopped being true once run_corpus.py started calling ai_postprocess (Stage 4 AI)
+    # and, now, summary_ai_extract (product_rules.AI_PIPELINE, the MRAM SUMMARY route) —
+    # both call Bedrock directly from inside this worker process. The role must ALSO grant:
+    #   bedrock:InvokeModel  on the model ARN(s) named by ACI_STAGE4_AI_MODEL, region
+    #                        eu-west-1 (see ai_postprocess.resolve_model / MODEL_ALIASES)
+    # Still no OpenSearch. Until that statement is added, any run with Stage 4 AI or the
+    # summary AI route enabled gets AccessDenied on every call — see the note in
+    # .github/workflows/build-extract-image.yml and docs/GPU_EXTRACTION_RUNBOOK.md.
+    #   s3:GetObject         on arn:aws:s3:::BUCKET/corpus-src/*
+    #   s3:PutObject         on arn:aws:s3:::BUCKET/corpus/2026-08-19/*
+    #   s3:ListBucket        on arn:aws:s3:::BUCKET  (prefix-scoped to the two above)
+    eks.amazonaws.com/role-arn: arn:aws:iam::ACCOUNT_ID:role/corpus-extract-worker
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: corpus-extract
+  namespace: aosphere-extraction
+spec:
+  # 8 workers: 61,214 unique pages is ~134 GPU-hours at the T4 estimate, so ~17h wall-clock.
+  # Any count works — the balancer splits by unique pages (verified 7,651–7,652 across 8) — but
+  # completions, parallelism and CORPUS_SHARDS must all agree.
+  completions: 8
+  parallelism: 8
+  completionMode: Indexed
+  # Per-index retries: one poisonous document must not burn the retry budget of the other five
+  # shards. Requires Kubernetes 1.29+; drop both fields and use `backoffLimit: 12` on older.
+  backoffLimitPerIndex: 3
+  maxFailedIndexes: 6
+  template:
+    metadata:
+      labels:
+        app: corpus-extract
+      annotations:
+        # Karpenter must not evict a worker to consolidate nodes: that would kill an extraction
+        # part-way through a document to save cents. An involuntary spot reclaim can still take
+        # the node — that path is handled by SIGTERM plus resume — but a voluntary one must not.
+        karpenter.sh/do-not-disrupt: "true"
+        # ---- Filebeat: parse this container's stdout as JSON -------------------------------
+        # The cluster ships container logs with Filebeat 9 (DaemonSet `filebeat-beat-filebeat`
+        # in the `elastic-stack` namespace, ECK-managed). These are its autodiscover hints,
+        # set here so our parsing does not depend on the DaemonSet's global default — which we
+        # do not own and which can change without anyone touching this repo.
+        #
+        #   keys_under_root  our JSON keys become ROOT fields (aci.stage, event.action, …)
+        #                    rather than a nested blob under `json`. This is what makes them
+        #                    queryable as fields instead of as text.
+        #   overwrite_keys   our @timestamp, message and log.level win over Filebeat's. Needed
+        #                    for @timestamp especially: otherwise every event is stamped when
+        #                    the agent read it, not when it happened, and a 60s heartbeat
+        #                    series gets reordered by collection lag.
+        #   add_error_key    a line that is NOT valid JSON lands with `error.message` saying so
+        #                    instead of vanishing. Matters because the worker still prints
+        #                    plain prose alongside the events (the human-readable run log).
+        #
+        # This is also why no event may emit a field Filebeat owns — `host.name` is the NODE
+        # hostname, and with overwrite_keys ours would silently replace it. See
+        # obs/log.bind_service, which puts ours under aci.pod / aci.node instead.
+        co.elastic.logs/json.keys_under_root: "true"
+        co.elastic.logs/json.overwrite_keys: "true"
+        co.elastic.logs/json.add_error_key: "true"
+    spec:
+      serviceAccountName: corpus-extract
+      restartPolicy: OnFailure
+      # 900 when SIGTERM meant "finish the document in flight, then stop" — a 40-minute
+      # document needed the room. It no longer does: the worker now abandons the document
+      # where it is (see corpus_worker._on_signal), records the shard as interrupted and is
+      # gone within its own ~15s watchdog, so anything past a minute is time the node spends
+      # waiting on a process that has already left. The document in flight is redone from S3
+      # on restart either way, which is what made the long wait optional to begin with.
+      terminationGracePeriodSeconds: 60
+      nodeSelector:
+        nvidia.com/gpu.present: "true"
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: worker
+          image: ACCOUNT_ID.dkr.ecr.eu-west-1.amazonaws.com/aosphere-corpus-extract:latest
+          # No args: everything comes from the environment, so the ONLY edit needed to start a
+          # fresh baseline is CORPUS_RESULTS. The full corpus runs by default — 36 products,
+          # 1,088 files = 891 distinct documents = 61,214 pages once duplicates are cloned
+          # rather than re-extracted. Extraction and scoring only: no vector push, no gallery.
+          env:
+            # THIS NAMES THE RUN. Resume is always on against it: a new prefix re-extracts the
+            # whole corpus, the same prefix continues an interrupted one. There is no force flag.
+            - name: CORPUS_RESULTS
+              value: s3://aosphere-tenant-dev1-core-index/corpus/2026-08-19
+            - name: CORPUS_SOURCE
+              value: s3://aosphere-tenant-dev1-core-index/corpus-src
+            # CORPUS_OUT is deliberately unset: the scratch dir then derives from the prefix
+            # (/work/out/2026-08-19), so a restarted pod cannot inherit an older run's trees.
+            - name: CORPUS_SHARDS
+              value: "8"                       # must equal spec.completions
+            - name: AWS_REGION
+              value: eu-west-1
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            # ---- run events -> stdout -> the node's log agent -> Kibana ----------------
+            # The worker emits one JSON object per line for every run, document, stage,
+            # heartbeat, Bedrock call and failure. Nothing here connects to Elasticsearch:
+            # the events are printed, and the agent that already ships this container's
+            # stdout does the rest. See docs/RUN_LOGGING.md.
+            #
+            # json   -> the agent parses JSON stdout into fields (the usual Fluent Bit /
+            #           Filebeat setup). Each key becomes a queryable field.
+            # logfmt -> the agent does NOT parse it, and a JSON blob would land as one
+            #           opaque `message` string. `pages=57 stage=stage2_mineru` at least
+            #           stays greppable and can be split by an ingest pipeline later.
+            # off    -> print nothing structured.
+            - name: ACI_LOG_FORMAT
+              value: "json"
+            # WHICH CODE IS ACTUALLY RUNNING. Without it `service.version` is absent and
+            # "is my fix in this run" is unanswerable from the logs — which is how the
+            # first cluster run ended up debugged from S3 artefacts instead. Must be
+            # rewritten with the image tag by whatever renders this manifest (the helm
+            # values in k8s-deployment, for the dev1 cluster).
+            - name: IMAGE_TAG
+              value: "REPLACED_AT_DEPLOY"
+            # The node, from the downward API. One bad spot node accounting for every
+            # stall is a one-filter answer with this field and an unaskable question
+            # without it — the pod name alone does not say where the pod ran.
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          resources:
+            requests:
+              cpu: "6"
+              memory: 24Gi
+              # ~152 MB per finished document; a 6-way shard is ~100 documents (~16 GB) plus
+              # 1.23 GB of source PDFs. 60 Gi leaves room for MinerU's page images.
+              ephemeral-storage: 60Gi
+              nvidia.com/gpu: 1
+            limits:
+              cpu: "8"
+              memory: 32Gi
+              ephemeral-storage: 60Gi
+              nvidia.com/gpu: 1
+          volumeMounts:
+            - name: work
+              mountPath: /work
+            - name: dshm
+              mountPath: /dev/shm
+      volumes:
+        - name: work
+          emptyDir:
+            sizeLimit: 60Gi
+        # Torch dataloader workers use shared memory; the container default of 64 MB is a
+        # well-known cause of "DataLoader worker (pid N) is killed by signal: Bus error".
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 8Gi

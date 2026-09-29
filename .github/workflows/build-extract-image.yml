@@ -1,0 +1,564 @@
+# =============================================================================
+# Build the core-index EXTRACTION WORKER image (GPU).
+#
+# WHAT THIS BUILDS
+#   ./Dockerfile.extract -> ECR aosphere-core-index-extract.
+#   This is the GPU extraction worker (ENTRYPOINT scripts/corpus_worker.py). It
+#   is run as a Kubernetes *Job* by the `core-index-extract` chart in
+#   k8s-deployment — it is NOT a service: it serves no traffic, exposes no port
+#   and has no Deployment, Service or Ingress. It extracts and scores a corpus
+#   and exits.
+#
+#   It is deliberately SEPARATE from the root ./Dockerfile, which builds the
+#   core-index API + frontend. That image must stay small and must not carry
+#   several GB of vision models; this one has no reason to carry uvicorn.
+#   Dockerfile.extract's own header explains the split in more detail.
+#
+# WHY A BESPOKE WORKFLOW (and not the shared library CD workflow)
+#   Skandiam/gh-action-library/.github/workflows/docker-continuous-deployment.yml
+#   hardcodes `file: Dockerfile`, so it physically cannot build this image. On
+#   top of that it bumps the Helm values, syncs the ArgoCD app and writes
+#   DynamoDB deployment bookkeeping — all of which describe a long-running
+#   *service* rollout. A batch worker image needs none of it. So this workflow
+#   copies the library's build job mechanics verbatim (ECR login, buildx,
+#   vars.ECR_REPO_URL, the registry cache pattern, the permissions block) and
+#   then does its own, much smaller, values bump.
+#
+# THIS IS THE ONLY THING A DEVELOPER NEEDS TO RUN
+#   Build + deploy + change CORPUS_SHARDS + switch plan/extract are all inputs
+#   here. Nothing has to be hand-edited in k8s-deployment.
+#
+#     new image                -> tag=<new>,  build=true
+#     change shard count       -> tag=<current>, build=false, shards=8
+#     dry run -> real run      -> tag=<current>, build=false, mode=extract
+#     start a FRESH extraction -> set run_id to a new value (see below)
+#
+#   run_id is the S3 output prefix AND the resume key. Leave it BLANK to keep
+#   the current one, which is what you want when shipping a new image into an
+#   in-flight run — the worker skips any document that already has a
+#   scorecard.json there. Setting a new run_id re-extracts the whole corpus.
+#
+#   The chart names the Job core-index-extract-<runId>-<specHash>, so a new tag
+#   or shard count produces a NEW Job (their pod template and completions are
+#   immutable) while leaving the S3 prefix alone. Never kubectl-patch the Job.
+#
+# THIS IS A BIG, SLOW, INFREQUENT BUILD
+#   The image carries TWO full torch/CUDA environments (the pipeline env from
+#   requirements.txt, plus MinerU's own /opt/venv-mineru which pins its own
+#   torch/transformers) AND the MinerU model weights baked in via
+#   `mineru-models-download -m all`. ~6.9 GiB compressed in ECR, ~25 min cold,
+#   and ~7 GiB pushed every time. That is why the build is skippable: changing
+#   only shards or mode needs no new image.
+#
+# PREREQUISITE
+#   The ECR repository `aosphere-core-index-extract` must exist in the
+#   corp-internal registry before the first run, i.e. it must be added to
+#   `ecr_service_repositories` in infra-deployment (aws/module/corp-internal)
+#   and applied. As of this workflow being written only `aosphere-core-index`
+#   exists; without the extract repo the push step fails with
+#   RepositoryNotFoundException.
+#
+#   The extract worker's IRSA role (`aosphere-tenant-dev1-irsa-core-index-extract-role`,
+#   see docs/GPU_EXTRACTION_RUNBOOK.md) is documented as S3-only: no Bedrock, no
+#   OpenSearch. summary_ai_extract.py (the MRAM summary route, summary_ai_enabled below)
+#   calls Bedrock directly from inside this same worker process, and so does Stage 4 AI
+#   before it — that IAM policy has not been widened for either. Until it grants
+#   bedrock:InvokeModel (scoped to the model ARN in ACI_STAGE4_AI_MODEL, region
+#   eu-west-1), a run with summary_ai_enabled=true will get AccessDenied on every MRAM
+#   SUMMARY document — untick it, or the equivalent stage4_ai_enabled, until that IAM
+#   change lands. That change is Terraform in a different repo, not this one.
+# =============================================================================
+name: Build & Deploy Extract Worker
+
+run-name: >-
+  extract ${{ inputs.tag }} | shards=${{ inputs.shards }} | ${{ inputs.mode }}${{
+  inputs.build == false && ' (deploy only)' || '' }} | by ${{ github.actor }}
+
+on:
+  # Manual only. No push/tag trigger: this image is built on demand, not on
+  # every release — see the size/duration note above.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Image tag (e.g. 2026.08.34-dev-02)"
+        required: true
+        type: string
+      shards:
+        # Drives CORPUS_SHARDS *and* the Job's completions/parallelism, which the
+        # chart derives from this single value so they can never drift apart.
+        # One pod per shard, one g4dn.2xlarge spot node per pod.
+        # Total GPU-hours are the same at any shard count — only wall-clock
+        # changes. The dev1 GPU node group is capped at 8, and the account's
+        # "All G and VT Spot" quota (64 vCPU) fits exactly 8 x g4dn.2xlarge.
+        description: "CORPUS_SHARDS — pods to run in parallel (1-8)"
+        required: true
+        default: "1"
+        type: string
+      mode:
+        # Controls what the DEPLOYED JOB DOES. It does not control whether the
+        # Job is deployed — both modes create the Job, provision a GPU spot node
+        # and pull the image. The difference is only what the worker then does.
+        #
+        # selftest-> args: ["--selftest"] — record what this container can actually
+        #            do (GPU name, total/free VRAM, torch + MinerU versions, the
+        #            RESOLVED models-dir, /dev/shm size) to
+        #            s3://<bucket>/<runId>/_selftest/shard-N.json and exit.
+        #            NON-ZERO when there is no CUDA or MinerU will not import, so
+        #            a broken image fails in ~1 min instead of grinding through
+        #            the corpus. Run this FIRST after any new image: the first
+        #            cluster run extracted 4,213 pages before anyone could tell
+        #            whether MinerU had its models, and the answer was only in
+        #            Kibana. This writes it where S3 can be read instead.
+        # plan    -> args: ["--plan"] — sync the source corpus, list existing
+        #            scorecards, print the shard assignment and page estimate,
+        #            exit 0. ~4 min. Extracts nothing and writes nothing to S3,
+        #            but it IS a real end-to-end rehearsal: scale-from-zero, the
+        #            device plugin, the image pull and IRSA are all exercised.
+        # extract -> args: []         — the real run. Hours to days.
+        description: "selftest = report what the GPU/container can do | plan = rehearsal | extract = the real run"
+        required: true
+        default: plan
+        type: choice
+        options: [selftest, plan, extract]
+      build:
+        # Rebuilding is ~25 min and ~7 GiB pushed. Changing only shards or mode
+        # needs no new image, so allow deploying an existing tag as-is.
+        description: "Build the image. Uncheck to redeploy an existing tag."
+        required: false
+        default: true
+        type: boolean
+      run_id:
+        # NAMES THE S3 RUN and is the resume key: the worker skips any document
+        # that already has a scorecard.json under this prefix. Leave blank to
+        # keep whatever the values file already has — that is what you want when
+        # shipping a new image into an in-flight run. Set a NEW value only to
+        # start a fresh extraction from zero.
+        description: "S3 run prefix / resume key. BLANK = keep current (resume)."
+        required: false
+        default: ""
+        type: string
+      disable_toc_rescue:
+        # Kill-switch for the PRINTED-CONTENTS-PAGE repair. Despite the name it no
+        # longer touches the fallback chain: the chain's printed-TOC tier was removed
+        # (it only ever stood down), and what this now disables is the PRE-FLIGHT in
+        # run_corpus._preflight_outline -- the step that repairs an untrustworthy
+        # bookmark outline BEFORE Stage 2 is paid for.
+        #
+        # Leave it OFF. Disabling the pre-flight does not save a pass, it costs one:
+        # a document with a bad outline extracts against that outline, scores badly
+        # and escalates to MinerU full anyway. Measured on Australia__181815 (171
+        # pages, 0 outline entries): 56.9 min with the repair deferred, ~26 min with
+        # the pre-flight doing it up front, same output. Only reach for it to rule
+        # the repair out while debugging something else.
+        #
+        # Sets DISABLE_TOC_RESCUE=1 in the Job. The chart emits the variable ONLY
+        # when this is checked, because the worker tests it for TRUTHINESS -- an
+        # emitted "false" would disable the repair while reading as enabled.
+        #
+        # Changing this changes the Job's spec hash and therefore its NAME, so it
+        # starts a NEW Job rather than altering the running one. Same mechanic as
+        # changing tag or shards, and it resumes: completed documents are skipped
+        # via their S3 scorecards.
+        description: "Skip the tier-2 toc_rescue fallback (faster, weaker outlines)"
+        required: false
+        default: false
+        type: boolean
+      stage4_ai_enabled:
+        # Stage-4 AI enrichment. Off by default; tick to run it.
+        #
+        # Sets ACI_STAGE4_AI_ENABLED on the Job. UNLIKE disable_toc_rescue above,
+        # the chart emits this variable on EVERY run as an explicit "1"/"0" rather
+        # than only when checked. The two flags are opposites: that one is a
+        # truthiness-read kill-switch whose "off" state can only be the ABSENCE of
+        # the variable, whereas the ACI_*_ENABLED family in core-index reads an
+        # explicit value AND defaults ON when unset (ACI_AUTH_ENABLED,
+        # ACI_AI_ENABLED). Omitting it would therefore leave stage 4 running, the
+        # opposite of this default.
+        #
+        # Changing this changes the Job's spec hash and therefore its NAME, so it
+        # starts a NEW Job rather than altering the running one, and it resumes:
+        # completed documents are skipped via their S3 scorecards.
+        description: "Enable stage-4 AI enrichment"
+        required: false
+        default: false
+        type: boolean
+      stage4_ai_workers:
+        # How many sections stage 4 sends to Bedrock CONCURRENTLY, per pod.
+        #
+        # Sections are independent files with independent model calls, so this is
+        # WALL-CLOCK ONLY. It does not change what gets billed, only how fast the
+        # bill is incurred.
+        #
+        # THIS OVERRIDES THE CODE DEFAULT, WHICH IS 1. config.py keeps
+        # stage4_ai_workers small on purpose -- each call already carries several
+        # page images, and Bedrock's per-account concurrency is the real ceiling.
+        # The multiplier that matters is shards x workers: 8 shards at 6 workers is
+        # 48 concurrent Converse calls against one account. If stage 4 starts
+        # throttling, this number is why -- check AWS/Bedrock InvocationThrottles
+        # before raising it.
+        #
+        # type: string, not number -- workflow_dispatch supports only string,
+        # choice, boolean and environment. Validated as a positive integer below,
+        # exactly as `shards` is.
+        #
+        # Sets ACI_STAGE4_AI_WORKERS on the Job. Changing it changes the Job's spec
+        # hash and therefore its NAME, so it starts a NEW Job rather than altering
+        # the running one, and it resumes: completed documents are skipped via
+        # their S3 scorecards.
+        description: "Stage-4 concurrent Bedrock calls per pod (wall-clock only)"
+        required: false
+        default: "6"
+        type: string
+      summary_ai_enabled:
+        # The MRAM SUMMARY route (product_rules.AI_PIPELINE / summary_ai_extract.py) — a
+        # direct Bedrock transcription that replaces stages 1-3 for that one folder, taken
+        # automatically whenever a matching document is in the shard. On by default —
+        # unlike stage4_ai_enabled, this is not an optional enrichment on top of a normal
+        # extraction, it IS how those documents get extracted at all; leaving it off would
+        # silently fall through to Stage 1, which product_rules.AI_PIPELINE's own
+        # measurement already found wrong for these documents. Untick only to force those
+        # documents to SKIP while the worker's IAM role has no Bedrock access (see the
+        # workflow header) rather than spend GPU time retrying an AccessDenied.
+        #
+        # Sets ACI_SUMMARY_AI on the Job, same explicit-every-run contract as
+        # stage4_ai_enabled: the chart must emit "1"/"0" on every run, never omit it,
+        # because run_corpus.py reads it with a default of "1" — omitting the variable
+        # when unticked would leave the route running, the opposite of this toggle.
+        #
+        # Changing this changes the Job's spec hash and therefore its NAME, so it starts a
+        # NEW Job rather than altering the running one, and it resumes: completed
+        # documents are skipped via their S3 scorecards.
+        description: "Enable the MRAM summary AI pipeline (needs Bedrock IAM — see header)"
+        required: false
+        default: true
+        type: boolean
+      environment:
+        # Selects which values-<env>.yaml in k8s-deployment gets rewritten, so the
+        # env must already have: a core-index-extract values file, the chart
+        # registered in the mother chart, and a GPU node group. stage1 was added
+        # when the workload moved there -- eu-west-1 has no A10G/L4 capacity, and
+        # g6 (L4) is only offered in eu-west-2.
+        #
+        # NOTE stage1 runs the compute but reads and writes the DEV1 S3 bucket,
+        # using static credentials rather than IRSA. That is deliberate: see
+        # awsRegion in values-stage1.yaml, which stays eu-west-1 (the BUCKET's
+        # region) even though the cluster is in eu-west-2.
+        description: "Target environment"
+        required: true
+        default: stage1
+        type: choice
+        options: [stage1, dev1]
+
+# Matches the library CD workflow: id-token for the runner's OIDC/IRSA path to
+# ECR, contents:read for the checkout. Nothing here needs write access.
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  build_and_push_extract_image:
+    name: Build and Publish extraction-worker image
+    # Skipped when redeploying an existing tag (shards/mode-only changes). The
+    # deploy job below uses `!failure() && !cancelled()` so it still runs.
+    if: ${{ inputs.build }}
+    # NOT optional, and not a copy/paste of the default runner label. The rest
+    # of the corp-internal ARC fleet is arm64/Graviton. Building this image
+    # there would mean QEMU-emulating an amd64 build of two full torch/CUDA
+    # environments plus `mineru-models-download -m all` — many hours at best,
+    # and realistically an OOM or a QEMU fault partway through. The
+    # corp-internal-arc-runner-amd64 scale set runs on the dedicated
+    # x86 build-amd64 node group and builds natively.
+    runs-on: corp-internal-arc-runner-amd64
+    # 360 == the GitHub Actions default, stated explicitly so nobody "helpfully"
+    # trims it. It is the right ceiling here rather than an oversight: a cold
+    # build installs torch twice and pulls several GB of MinerU model weights
+    # from HuggingFace, so hours — not minutes — is the expected shape. Left at
+    # the default so a genuinely wedged build still gets reaped.
+    timeout-minutes: 360
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Login to ECR
+        # Same idiom as the library build job: registry only, credentials come
+        # from the runner's IRSA via the ECR credential helper.
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ vars.ECR_REPO_URL }}
+
+      # No CodeArtifact auth step. core-index is a pure-PyPI Python repo — the
+      # existing docker-continuous-deployment.yml caller says the same, and the
+      # library's CodeArtifact token step is Maven-only anyway.
+      #
+      # No `build-args: ECR_REPO_URL=...` either: unlike the root Dockerfile,
+      # Dockerfile.extract has no ARG — it starts FROM python:3.12-slim.
+
+      - name: Build and Push Image
+        uses: docker/build-push-action@v7
+        with:
+          platforms: linux/amd64
+          file: Dockerfile.extract
+          context: .
+          push: true
+          tags: |
+            ${{ vars.ECR_REPO_URL }}/aosphere-core-index-extract:${{ inputs.tag }}
+          # Registry cache, mirroring the library workflow's pattern. It earns
+          # its keep more here than anywhere else in the fleet: with mode=max
+          # the model-download and the two pip install layers survive between
+          # runs, which is the difference between a multi-hour rebuild and a
+          # quick one when only application code changed. Note the cost — a
+          # mode=max cache for a 25-35 GB image is a comparably large object in
+          # ECR, so watch the repo's storage/lifecycle policy.
+          cache-from: type=registry,ref=${{ vars.ECR_REPO_URL }}/aosphere-core-index-extract:cache-amd64
+          cache-to: type=registry,ref=${{ vars.ECR_REPO_URL }}/aosphere-core-index-extract:cache-amd64,mode=max
+
+      # NO TRIVY GATE — deliberate, not an oversight.
+      #
+      # 1. CUDA/torch/MinerU base layers permanently carry unfixed upstream
+      #    CVEs. A blocking scan on this image would never go green, so it
+      #    would not be a gate, it would be a permanently-red check that
+      #    everyone learns to ignore (and it would block the build outright).
+      # 2. The risk profile does not justify one: this is an internal batch
+      #    worker. It serves no traffic, listens on no port, is not
+      #    internet-reachable, and runs as a Job on a tainted GPU node group.
+      # 3. Practically, scanning would mean pulling 25-35 GB back onto the
+      #    runner purely to scan it, on a node group whose build volume is
+      #    300 GB shared with the build cache.
+      #
+      # The repo is still covered: trivy-pr-scan.yml gates PRs, and the root
+      # API/frontend image is scanned by the library CD workflow.
+      #
+      # If a scan is ever added here, it MUST be `continue-on-error: true` and
+      # MUST set the GHCR DB mirrors — Trivy's default mirror.gcr.io
+      # intermittently 404s the DB blob fleet-wide, which is fatal at init:
+      #     TRIVY_DB_REPOSITORY: ghcr.io/aquasecurity/trivy-db:2
+      #     TRIVY_JAVA_DB_REPOSITORY: ghcr.io/aquasecurity/trivy-java-db:1
+
+  deploy_to_k8s:
+    name: Update k8s-deployment values
+    needs: [build_and_push_extract_image]
+    # `always() && !failure() && !cancelled()` is the idiom the library CD
+    # workflow uses: it lets this run when the build job was SKIPPED (deploy an
+    # existing tag) while still refusing to deploy after a FAILED build.
+    if: ${{ always() && !failure() && !cancelled() }}
+    runs-on: corp-internal-arc-runner-ops
+    timeout-minutes: 10
+    steps:
+      - name: Checkout k8s-deployment
+        uses: actions/checkout@v7
+        with:
+          repository: Skandiam/k8s-deployment
+          token: ${{ secrets.RUNNER_ACCESS_TOKEN }}
+          ref: main
+
+      - name: Verify the image tag exists in ECR
+        # Guards the deploy-only path in particular: without this, a typo in the
+        # tag lands in git, ArgoCD creates the Job, and the failure surfaces
+        # minutes later as ImagePullBackOff on a GPU node you are paying for.
+        env:
+          ECR_REPO_URL: ${{ vars.ECR_REPO_URL }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          # Registry host is <acct>.dkr.ecr.<region>.amazonaws.com — strip BOTH
+          # ends. Stripping only the prefix leaves "eu-west-2.amazonaws.com",
+          # which the CLI rejects with "doesn't match a supported format".
+          REGION="${ECR_REPO_URL#*.dkr.ecr.}"
+          REGION="${REGION%%.amazonaws.com}"
+          # Must look like a region (eu-west-2, us-east-1). Checking only for
+          # non-empty would let "nonsense" through to a confusing CLI error.
+          case "$REGION" in
+            [a-z]*-[a-z]*-[0-9]) : ;;
+            *) echo "::error::could not parse a region from ECR_REPO_URL='$ECR_REPO_URL' (got '$REGION')"; exit 1 ;;
+          esac
+          aws ecr describe-images \
+            --repository-name aosphere-core-index-extract \
+            --region "$REGION" \
+            --image-ids "imageTag=$TAG" >/dev/null
+          echo "image tag $TAG found in ECR ($REGION)"
+
+      - name: Update values
+        # All inputs come through env rather than being interpolated straight
+        # into the script — workflow_dispatch inputs are attacker-controlled in
+        # principle, and quoting them here keeps them out of the shell grammar.
+        env:
+          VALUES_FILE: helm-charts/core-index-extract/values-${{ inputs.environment }}.yaml
+          TAG: ${{ inputs.tag }}
+          SHARDS: ${{ inputs.shards }}
+          MODE: ${{ inputs.mode }}
+          RUN_ID: ${{ inputs.run_id }}
+          DISABLE_TOC_RESCUE: ${{ inputs.disable_toc_rescue }}
+          STAGE4_AI_ENABLED: ${{ inputs.stage4_ai_enabled }}
+          STAGE4_AI_WORKERS: ${{ inputs.stage4_ai_workers }}
+          SUMMARY_AI_ENABLED: ${{ inputs.summary_ai_enabled }}
+          GH_RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+
+          case "$SHARDS" in
+            ''|*[!0-9]*) echo "::error::shards must be a positive integer, got '$SHARDS'"; exit 1 ;;
+          esac
+
+          # Same shape as the shards check above. Rejects 0 as well as non-numerics:
+          # the worker does max(1, int(...)) so a 0 would silently become 1 rather
+          # than erroring, and a run that quietly ignores the number you typed is
+          # the failure mode this whole file keeps guarding against.
+          case "$STAGE4_AI_WORKERS" in
+            ''|*[!0-9]*) echo "::error::stage4_ai_workers must be a positive integer, got '$STAGE4_AI_WORKERS'"; exit 1 ;;
+            0) echo "::error::stage4_ai_workers must be >= 1, got '$STAGE4_AI_WORKERS'"; exit 1 ;;
+          esac
+          if [ "$SHARDS" -lt 1 ] || [ "$SHARDS" -gt 8 ]; then
+            echo "::error::shards must be 1-8 -- one pod and one GPU node per shard,"
+            echo "::error::and ng_gpu_max_capacity is 8 on every environment. Raising it"
+            echo "::error::means a terraform change AND checking that env's G/VT quota:"
+            echo "::error::8 x g4dn.2xlarge). Raise both before going higher."
+            exit 1
+          fi
+
+          # Re-enable. Dispatching this workflow with mode=plan or mode=extract
+          # is an unambiguous "I want this to run", so it must undo a previous
+          # Stop Extract Worker. Without this the workflow updates the tag and
+          # shard count, reports success, and NOTHING HAPPENS -- because
+          # `enabled: false` makes the chart render zero objects. Stop is the
+          # only thing that sets false; deploy is the only thing that sets true.
+          sed -i -E "s/^enabled: .*/enabled: true/" "$VALUES_FILE"
+
+          # image.tag lives under the `image:` block, so anchor the range to it
+          # rather than replacing the first `tag:` in the file.
+          sed -i -E "/^image:/,/^[a-zA-Z]/s/^  tag: .*/  tag: \"$TAG\"/" "$VALUES_FILE"
+          sed -i -E "s/^shards: .*/shards: $SHARDS/" "$VALUES_FILE"
+
+          if [ "$MODE" = "selftest" ]; then
+            sed -i -E 's/^args: .*/args: ["--selftest"]/' "$VALUES_FILE"
+          elif [ "$MODE" = "plan" ]; then
+            sed -i -E 's/^args: .*/args: ["--plan"]/' "$VALUES_FILE"
+          else
+            sed -i -E 's/^args: .*/args: []/' "$VALUES_FILE"
+          fi
+
+          # Booleans arrive as the strings "true"/"false", exactly the values the
+          # chart wants, so this is a straight write rather than a conditional.
+          # Do NOT skip writing "false": the value must be rewritten every run, or
+          # unchecking the box would silently leave a previous run's `true` behind.
+          # sed exits 0 when it matches NOTHING, so without this the toggle would
+          # be a silent no-op if the chart side is not merged yet -- the workflow
+          # would report success having changed nothing, which is precisely how
+          # the "enabled flag never flipped back" bug behaved.
+          if ! grep -q '^disableTocRescue:' "$VALUES_FILE"; then
+            echo "::error::$VALUES_FILE has no 'disableTocRescue:' key. The chart side"
+            echo "::error::of this feature is not merged in k8s-deployment yet, so the"
+            echo "::error::toggle would do nothing. Merge that first."
+            exit 1
+          fi
+          sed -i -E "s/^disableTocRescue: .*/disableTocRescue: $DISABLE_TOC_RESCUE/" "$VALUES_FILE"
+
+          # Same contract as disableTocRescue: always rewrite, never skip on
+          # "false", and fail loudly when the chart side is not merged -- sed exits
+          # 0 when it matches nothing, so the toggle would silently do nothing
+          # while the run still went green.
+          if ! grep -q '^stage4AiEnabled:' "$VALUES_FILE"; then
+            echo "::error::$VALUES_FILE has no 'stage4AiEnabled:' key. The chart side"
+            echo "::error::of this feature is not merged in k8s-deployment yet, so the"
+            echo "::error::toggle would do nothing. Merge that first."
+            exit 1
+          fi
+          sed -i -E "s/^stage4AiEnabled: .*/stage4AiEnabled: $STAGE4_AI_ENABLED/" "$VALUES_FILE"
+
+          # Same contract as the flags around it: fail loudly when the chart side is
+          # not merged, because sed exits 0 when it matches nothing and the input
+          # would silently do nothing while the run went green.
+          if ! grep -q '^stage4AiWorkers:' "$VALUES_FILE"; then
+            echo "::error::$VALUES_FILE has no 'stage4AiWorkers:' key. The chart side"
+            echo "::error::of this feature is not merged in k8s-deployment yet, so the"
+            echo "::error::input would do nothing. Merge that first."
+            exit 1
+          fi
+          sed -i -E "s/^stage4AiWorkers: .*/stage4AiWorkers: $STAGE4_AI_WORKERS/" "$VALUES_FILE"
+
+          # Same contract again: always rewrite, never skip on "false", fail loudly when the
+          # chart side is not merged — sed's silent no-op-on-no-match is what let
+          # disableTocRescue go unwired for a whole PR before anyone noticed.
+          if ! grep -q '^summaryAiEnabled:' "$VALUES_FILE"; then
+            echo "::error::$VALUES_FILE has no 'summaryAiEnabled:' key. The chart side"
+            echo "::error::of this feature is not merged in k8s-deployment yet, so the"
+            echo "::error::toggle would do nothing. Merge that first."
+            exit 1
+          fi
+          sed -i -E "s/^summaryAiEnabled: .*/summaryAiEnabled: $SUMMARY_AI_ENABLED/" "$VALUES_FILE"
+
+          # Stamp this dispatch's run id. This is what makes a re-run with
+          # IDENTICAL inputs still deploy: the commit step below exits early when
+          # the values file has no diff, and the chart hashes the whole values tree
+          # into the Job name -- so with nothing changing there was no commit, no
+          # ArgoCD change and no Job, and the run still went green. The run id
+          # differs every dispatch, so the tree always differs.
+          #
+          # Same guard as disableTocRescue above: sed exits 0 when it matches
+          # NOTHING, so without this check an unmerged chart side would make the
+          # stamp a silent no-op and reintroduce the exact bug it fixes.
+          if ! grep -q '^githubRunId:' "$VALUES_FILE"; then
+            echo "::error::$VALUES_FILE has no 'githubRunId:' key. The chart side of"
+            echo "::error::this feature is not merged in k8s-deployment yet, so the"
+            echo "::error::stamp would do nothing and a no-op re-run would look green."
+            exit 1
+          fi
+          sed -i -E "s/^githubRunId: .*/githubRunId: \"$GH_RUN_ID\"/" "$VALUES_FILE"
+
+          # Blank run_id means "keep the current prefix" — that is the resume
+          # path, and the common case when shipping a new image mid-run.
+          # Setting it starts a FRESH extraction: a new prefix has no scorecards,
+          # so every document is re-extracted from zero.
+          if [ -n "$RUN_ID" ]; then
+            sed -i -E "s/^runId: .*/runId: \"$RUN_ID\"/" "$VALUES_FILE"
+          fi
+
+          echo "--- $VALUES_FILE ---"
+          grep -E '^(enabled|shards|runId|args|disableTocRescue|stage4AiEnabled|stage4AiWorkers|summaryAiEnabled|githubRunId):|^  tag:' "$VALUES_FILE"
+
+      - name: Commit and push
+        env:
+          VALUES_FILE: helm-charts/core-index-extract/values-${{ inputs.environment }}.yaml
+          ENVIRONMENT: ${{ inputs.environment }}
+          TAG: ${{ inputs.tag }}
+          SHARDS: ${{ inputs.shards }}
+          MODE: ${{ inputs.mode }}
+          GH_USERNAME: ${{ secrets.GH_USERNAME }}
+          GH_EMAIL: ${{ secrets.GH_EMAIL }}
+        run: |
+          set -euo pipefail
+          git config user.name "$GH_USERNAME"
+          git config user.email "$GH_EMAIL"
+          git add "$VALUES_FILE"
+          if git diff --cached --quiet; then
+            echo "no change — values already match; nothing to deploy"
+            exit 0
+          fi
+          git commit -m "[GitHub-Action][$ENVIRONMENT] core-index-extract: tag=$TAG shards=$SHARDS mode=$MODE - Run ${GITHUB_RUN_ID}"
+          git push origin main
+
+      - name: Summary
+        env:
+          TAG: ${{ inputs.tag }}
+          SHARDS: ${{ inputs.shards }}
+          MODE: ${{ inputs.mode }}
+          RUN_ID: ${{ inputs.run_id }}
+          ENVIRONMENT: ${{ inputs.environment }}
+        run: |
+          {
+            echo "### core-index-extract deployed to $ENVIRONMENT"
+            echo ""
+            echo "| field | value |"
+            echo "|---|---|"
+            echo "| image tag | \`$TAG\` |"
+            echo "| shards | $SHARDS |"
+            echo "| mode | $MODE |"
+            echo "| run id | ${RUN_ID:-unchanged (resume)} |"
+            echo ""
+            echo "ArgoCD auto-syncs on the git change. The chart names the Job"
+            echo "\`core-index-extract-<runId>-<specHash>\`, so this creates a NEW Job"
+            echo "and prunes the old one — the S3 prefix is untouched unless run id"
+            echo "changed, so an in-flight run resumes rather than restarting."
+          } >> "$GITHUB_STEP_SUMMARY"

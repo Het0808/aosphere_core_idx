@@ -1,0 +1,131 @@
+# Promotion worker: publishes ONE finished extraction run into the Doc Gallery.
+#
+# WHY A JOB AND NOT A THREAD IN THE SERVICE
+# The obvious shape — POST an endpoint, spawn a thread, poll a module-level dict — already
+# exists twice in this repo (embeddings/vector_load._JOB, service/entity_reindex._JOB) and
+# docs/VECTOR_INDEX_LIFECYCLE.md §2 records what it cost: with more than one replica the POST
+# landed on one pod and every GET on another, so the API reported `phase: idle` while a load
+# was running, and a rolling deploy killed the load outright. A promotion also grows into
+# Phase 2, where the embed stage is ~40 minutes of Bedrock calls — work that has no business
+# inside a pod serving search traffic.
+#
+# So: the job writes small durable progress objects to S3 and the service only READS them
+# (service/promotion_monitor.py). State survives the pod, and every replica gives the same
+# answer because there is only one copy of it.
+#
+# NO GPU. Phase 1 is S3 copy_object calls; Phase 2 is Bedrock HTTP plus CPU. Do not copy
+# extraction-job.yaml's nvidia.com/gpu requests, tolerations or nodeSelector — this runs on the
+# ordinary node pool.
+#
+# RESUME is by re-listing the TARGET, so a restarted or re-run job skips what is already
+# published and finishes the rest. Point it at the SAME --version to resume; a new version
+# re-publishes from scratch. Same rule as the extraction worker's CORPUS_RESULTS.
+#
+#   kubectl -n aosphere-extraction apply -f deploy/promotion-job.yaml
+#   kubectl -n aosphere-extraction logs -f job/corpus-promote
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: corpus-promote
+  namespace: aosphere-extraction
+  annotations:
+    # IRSA. A NEW role — corpus-extract-worker cannot do this: it has PutObject on corpus/*
+    # only, and a promotion's whole purpose is to write index/*.
+    #
+    #   s3:GetObject   on arn:aws:s3:::BUCKET/corpus/*         the run: scorecards, viewers
+    #   s3:GetObject   on arn:aws:s3:::BUCKET/corpus-src/*      Doc_metadata.json (document names)
+    #   s3:PutObject   on arn:aws:s3:::BUCKET/corpus/*/_promotion/*   its own progress
+    #   s3:GetObject   on arn:aws:s3:::BUCKET/index/*
+    #   s3:PutObject   on arn:aws:s3:::BUCKET/index/*/doc-gallery/*   <-- the new one
+    #   s3:ListBucket  on arn:aws:s3:::BUCKET  (prefix-scoped to corpus/, corpus-src/, index/)
+    #
+    # Deliberately NOT granted in Phase 1:
+    #   s3:PutObject   on index/latest      flipping the pointer is Phase 2's last stage, and
+    #                                       "Phase 1 cannot go live" should be a permissions
+    #                                       fact rather than a code convention
+    #   s3:DeleteObject anywhere            nothing here deletes; a lease is RELEASED by
+    #                                       writing released_at, not by deleting the object
+    #
+    # If the bucket has a default KMS key the role also needs kms:Decrypt and
+    # kms:GenerateDataKey — copy_object fails with an AccessDenied that reads like an S3
+    # problem otherwise. Check the bucket's default encryption before writing the policy.
+    eks.amazonaws.com/role-arn: arn:aws:iam::ACCOUNT_ID:role/corpus-promote
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: corpus-promote
+  namespace: aosphere-extraction
+spec:
+  completions: 1
+  parallelism: 1
+  # Two retries. A restart resumes from the target listing, so a retry re-attempts only what
+  # is missing — and the manifest is written once, at the end of a completed pass, so a killed
+  # attempt leaves the live gallery untouched.
+  backoffLimit: 2
+  template:
+    metadata:
+      labels:
+        app: corpus-promote
+      annotations:
+        # A promotion is minutes, but the manifest commit is the one moment worth protecting:
+        # being evicted between the copies and the commit means redoing the pass.
+        karpenter.sh/do-not-disrupt: "true"
+    spec:
+      serviceAccountName: corpus-promote
+      restartPolicy: OnFailure
+      # Long enough to finish the document in flight and publish progress after a SIGTERM.
+      terminationGracePeriodSeconds: 120
+      containers:
+        - name: promote
+          # The API image, NOT Dockerfile.extract: this path needs no MinerU and no model
+          # weights (~7 GiB). It is importable without fitz because the gallery's naming rules
+          # were moved into scripts/lib_gallery.py for exactly this reason.
+          image: ACCOUNT_ID.dkr.ecr.eu-west-1.amazonaws.com/core-index:TAG
+          command: ["python", "scripts/promote_run.py"]
+          # No args: every input is an env var, so this template never changes.
+          # `--from-request` instead consumes what the API recorded.
+          args: ["--probe-write"]
+          env:
+            - name: PROMOTE_RUN
+              value: "2026-08-21-02"
+            # Blank = <run>-p1. Set it to RESUME a specific promotion, or to -p2 for a second
+            # attempt with a different selection. It must be a legal OpenSearch index suffix
+            # (lowercase, [a-z0-9._-]) because in Phase 2 it also names aci-vectors-<version>.
+            - name: PROMOTE_VERSION
+              value: ""
+            - name: PROMOTE_GATES
+              value: "pass,review"
+            # Blank = every product in regions/region_map.PRODUCTS (Data Privacy, Shareholding
+            # Disclosure, Marketing Restrictions - Asset Management). A product outside that
+            # list has no product-qualified region identity, so it could never be searched.
+            - name: PROMOTE_PRODUCTS
+              value: ""
+            - name: PROMOTE_BY
+              value: "promotion-job"
+            - name: ACI_EXTRACTION_BUCKET
+              value: "aosphere-tenant-dev1-core-index"
+            - name: ACI_EXTRACTION_PREFIX
+              value: "corpus"
+            - name: ACI_CORPUS_SRC_PREFIX
+              value: "corpus-src"
+            - name: AWS_REGION
+              value: "eu-west-1"
+            # MUST NOT be set here. The reader resolves the gallery prefix from index/latest;
+            # pinning it would send the promotion somewhere the gallery does not look.
+            # - name: ACI_DOC_GALLERY_PREFIX
+            - name: PYTHONUNBUFFERED
+              value: "1"
+          resources:
+            requests:
+              cpu: "1"
+              memory: 1Gi
+              # Phase 1 downloads nothing: the copies are server-side and the only bytes that
+              # reach this pod are scorecards, read once and dropped. Phase 2 needs ~20Gi for
+              # the markdown trees, the seeded content dir and the rebuilt multi.npz.
+              ephemeral-storage: 2Gi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+              ephemeral-storage: 2Gi

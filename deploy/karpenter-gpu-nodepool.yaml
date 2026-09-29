@@ -1,0 +1,104 @@
+# GPU spot capacity, provisioned on demand by Karpenter and scaled back to zero when the
+# extraction Job finishes. Nothing here is always-on: the NodePool is a standing offer, and nodes
+# exist only while pods are pending.
+#
+# WHY SPOT IS THE RIGHT CHOICE *HERE* SPECIFICALLY
+# Spot is 37-55% cheaper but can be reclaimed on two minutes' notice, which normally argues for
+# on-demand on a 17-hour run — a reclaim at hour 12 costs a human noticing and restarting. On EKS
+# that cost disappears, because the whole loop is automatic:
+#
+#   spot reclaim notice -> Karpenter drains the node -> SIGTERM to the worker
+#     -> worker finishes the document in flight and uploads it, exits 0
+#     -> the Job reschedules that shard index -> Karpenter provisions a new spot node
+#     -> the worker lists scorecards from S3 and continues where it stopped
+#
+# The most a reclaim costs is one document. That makes the ~$34 saving on this run free of
+# operational risk, and it is why the Job's resume rule (see scripts/corpus_worker.py) had to be
+# correct before any of this was worth setting up.
+#
+# PREREQUISITES — these are cluster-level and NOT created by this file:
+#   1. Karpenter installed, including its interruption queue (the SQS/EventBridge wiring). Without
+#      the queue Karpenter never hears the reclaim notice and the pod is killed ungracefully
+#      instead of draining — resume still recovers, but the current document is always lost.
+#   2. The NVIDIA device plugin, so nvidia.com/gpu is an allocatable resource. The EKS
+#      accelerated AMIs bundle the driver; the plugin still has to be running.
+#   3. A GPU spot quota in eu-west-1 large enough for the fleet ("All G and VT Spot Instance
+#      Requests", counted in vCPUs — 8 x g5.xlarge is 32 vCPUs). Spot quota is separate from
+#      on-demand quota, and hitting it looks like pods that simply stay Pending.
+---
+apiVersion: karpenter.k8s.aws/v1
+kind: EC2NodeClass
+metadata:
+  name: gpu-extract
+spec:
+  # AL2023 accelerated variant ships the NVIDIA driver; the device plugin advertises the GPU.
+  amiFamily: AL2023
+  amiSelectorTerms:
+    - alias: al2023@latest
+  role: KarpenterNodeRole-CLUSTER_NAME
+  subnetSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: CLUSTER_NAME
+  securityGroupSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: CLUSTER_NAME
+  blockDeviceMappings:
+    - deviceName: /dev/xvda
+      ebs:
+        # The extraction image carries the baked MinerU weights (several GB) and each worker keeps
+        # ~16 GB of job trees plus page images. 200 GB is generous on purpose: a node that fills up
+        # evicts the pod mid-document, which is the one failure this design cannot make cheap.
+        volumeSize: 200Gi
+        volumeType: gp3
+        deleteOnTermination: true
+---
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: gpu-extract
+spec:
+  template:
+    metadata:
+      labels:
+        workload: corpus-extract
+    spec:
+      nodeClassRef:
+        group: karpenter.k8s.aws
+        kind: EC2NodeClass
+        name: gpu-extract
+      # Keeps everything else in the cluster off GPU nodes; the extraction Job tolerates it.
+      taints:
+        - key: nvidia.com/gpu
+          effect: NoSchedule
+      requirements:
+        # Spot FIRST, on-demand as a fallback. Karpenter picks the cheapest option that fits, so
+        # this reads as "spot whenever it exists, otherwise keep the run moving at on-demand
+        # price" rather than "fail if spot is unavailable".
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: ["spot", "on-demand"]
+        # Diversity is the real interruption defence: three families across every AZ gives
+        # Karpenter many pools to choose from, and a reclaim in one rarely coincides with another.
+        # All of these are single-GPU 16-24GB cards, which is what MinerU needs.
+        - key: karpenter.k8s.aws/instance-family
+          operator: In
+          values: ["g4dn", "g5", "g6"]
+        - key: karpenter.k8s.aws/instance-size
+          operator: In
+          values: ["xlarge", "2xlarge"]
+        - key: karpenter.k8s.aws/instance-gpu-count
+          operator: In
+          values: ["1"]
+        - key: kubernetes.io/arch
+          operator: In
+          values: ["amd64"]
+  limits:
+    # A ceiling on how much GPU this pool can ever create, so a misconfigured Job cannot quietly
+    # provision a fleet. 8 workers need 8.
+    nvidia.com/gpu: 8
+  disruption:
+    # WhenEmpty only. The default (WhenEmptyOrUnderutilized) lets Karpenter consolidate a
+    # half-idle node by evicting its pod — which here means killing a worker part-way through a
+    # 281-page document to save a few cents. Nodes still go away promptly once their pod is gone.
+    consolidationPolicy: WhenEmpty
+    consolidateAfter: 2m
