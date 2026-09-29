@@ -502,3 +502,44 @@ def test_a_04_dir_without_a_report_and_without_the_marker_still_is_not_a_run(tmp
     d = stage4_dashboard(job)
     assert d["ran"] is False
     assert "stage4_report.json" in d["reason"]
+
+
+# ---------------------------------------------------------------- section-mode contract
+# Root cause of every section-mode document reading ai_postprocess 0.0: the scorer held
+# section mode (run_stage4's default, which may add text read from the page images and
+# emit headings/emphasis — "reported, not enforced") to batched mode's character-exact
+# contract, where any single flag zeroes the score. Detection must survive; only the
+# verdict follows the contract the report declares.
+
+def _section_mode(job):
+    (job / "04_stage4_ai" / "stage4_report.json").write_text(json.dumps({
+        "mode": "section", "sections": [{"file": "07-marketing.md", "ok": True}],
+        "sections_total": 1, "sections_accepted": 1, "usage": {},
+    }))
+
+
+def test_section_mode_additions_are_reported_but_do_not_zero_the_score(job):
+    _section_mode(job)
+    r = _write(job, DOC.replace("MARKETING", "**MARKETING** recovered from the page image"))
+    added = [f for f in r["flags"] if f["kind"] in ("content_added", "markup_injected")]
+    assert added, "section-mode additions must still be detected"
+    assert all(f["severity"] == "warning" and f["contract"] == "batched" for f in added)
+    assert r["mode"] == "section" and r["passed"] and r["score"] == 100.0
+
+
+def test_section_mode_still_charges_a_cell_that_left_the_document(job):
+    _section_mode(job)
+    lost = "If so, please provide recommended wording in Section C of Appendix 3 here"
+    # Same tree as test_a_short_deleted_cell_is_flagged, which pins it as "deleted".
+    _tree(job, {"08.md": f"<table><tr><td>{lost}</td><td></td></tr></table>"},
+          {"07.md": "<table><tr><td>If so, please provide recommended wording in "
+                    "Section C of Appendix 1 instead</td></tr></table>",
+           "08.md": "<table><tr><td>unrelated</td></tr></table>"})
+    r = compute_stage4(job)
+    assert any(f["kind"] == "cell_missing" and f["severity"] == "critical" for f in r["flags"])
+    assert r["score"] == 88.0 and not r["passed"]
+
+
+def test_batched_mode_keeps_its_character_exact_contract(job):
+    r = _write(job, DOC.replace("MARKETING", "**MARKETING** recovered from the page image"))
+    assert r["mode"] == "batched" and r["score"] == 0.0 and not r["passed"]

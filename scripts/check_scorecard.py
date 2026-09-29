@@ -176,9 +176,19 @@ CREDIT_FAILED = FLAGGED_WEIGHT
 # and an empty answer. Not a per-table credit loss like CREDIT_FAILED: nothing is
 # missing and the table may hold dozens of other, perfectly-stitched rows, so
 # scoring one page-break glitch like a whole failed table would drown it out.
-# A small fixed deduction per occurrence instead, similar order of magnitude to
-# the gap between CREDIT_CONFIDENT and CREDIT_UNCERTAIN.
-ROW_SPLIT_PENALTY = 0.15
+#
+# Scored in POINTS, severity-weighted, and not as a share of table credit: it used to
+# be 0.15 table-credit, which divided by the table count and so cost ~5 points in a
+# 3-table document and ~0.4 in a 35-table one for the same broken row — the size
+# dilution CELL_DEFECT_PENALTY exists to avoid. Now the cost is proportional to how
+# many rows are split and how certain each one is:
+#
+#   points = min(ROW_SPLIT_CAP, ROW_SPLIT_POINTS * sum(severity))
+#
+# with severity 1.0 for a confirmed split (kept_as_separate_row) — the same unit as
+# one confirmed cell defect — and less for an unconfirmed one (below).
+ROW_SPLIT_POINTS = 1.0
+ROW_SPLIT_CAP = 10.0
 
 # A row hybrid_extract's stitcher couldn't even check for a continuation, because the
 # new page's leading cell already holds real text (usually the next sub-question's own
@@ -187,9 +197,24 @@ ROW_SPLIT_PENALTY = 0.15
 # mid-sentence" evidence, but this shape hasn't been checked against the corpus the way
 # the blank-cell one has, and a length + not-a-heading filter still leaves real
 # false-positive risk (a genuinely new sub-section that happens to follow an answer
-# ending mid-list). Half the confirmed penalty: worth moving the score, not worth
-# treating as equally certain.
-ROW_SPLIT_PENALTY_UNCONFIRMED = 0.08
+# ending mid-list). At most half a confirmed split, scaled further by the stitcher's
+# own continuation confidence (0-100), floored so a detected one is never free:
+#
+#   severity = ROW_SPLIT_UNCONFIRMED_WEIGHT * clamp(confidence / 100, 0.2, 1.0)
+ROW_SPLIT_UNCONFIRMED_WEIGHT = 0.5
+
+# Every structural term Fidelity charges in points — source-cited shape defects plus
+# row splits — shares this ceiling, so one badly stitched document cannot lose more
+# than this from structure alone however many heuristics fire on it.
+FIDELITY_STRUCTURE_CAP = 15.0
+
+# A table-level "rows have inconsistent widths" finding is the SYMPTOM a page-break row
+# split leaves behind (the orphaned continuation row is wider or narrower than its
+# table). Measured on this corpus: all 27 unresolved row splits sat inside a table
+# check_source_fidelity also flagged inconsistent_table_columns. Charging both billed
+# one physical defect twice, so the specific row-level finding is charged and the
+# generic table-level one it explains is not (it stays listed, marked absorbed).
+_ROW_SPLIT_SYMPTOM_KINDS = frozenset({"inconsistent_table_columns"})
 
 # Explains every dimension in the UI: what it measures, where the number comes
 # from, what to do when it's low, and where it is still weak. Kept beside the
@@ -366,6 +391,108 @@ def _cell_defect_penalty(count: int) -> float:
     PDF, so it costs the same regardless of document size, capped so a pile-up in
     one kind cannot alone zero the dimension."""
     return min(count, CELL_DEFECT_CAP) * CELL_DEFECT_PENALTY
+
+
+_ROW_SPLIT_ACTIONS = ("kept_as_separate_row", "unflagged_continuation")
+
+
+def _stitch_page(a: dict) -> int | None:
+    """The page a stitch anomaly's row sits on: `pages` is the whole table's range and
+    `block` the row's offset into it (the stitcher checks the first row of every page
+    after the table's first)."""
+    pages, block = a.get("pages") or [], a.get("block")
+    return pages[block] if isinstance(block, int) and 0 <= block < len(pages) else None
+
+
+def _stitch_key(a: dict) -> str:
+    """The dismissal key of the finding _collect_findings builds for this anomaly —
+    one definition, so a dismissal made in the UI is the one the scorer honours."""
+    prefix = ("row-split-unflagged" if a.get("action") == "unflagged_continuation"
+              else "row-split" if a.get("action") == "kept_as_separate_row" else "row-merge")
+    return dis.hierarchy_key(f"{prefix}-{a.get('table_id')}-{_stitch_page(a)}-{a.get('block')}")
+
+
+def _row_split_severity(a: dict) -> float:
+    if a.get("action") == "kept_as_separate_row":
+        return 1.0
+    if a.get("action") == "unflagged_continuation":
+        conf = a.get("confidence")
+        frac = 0.5 if not isinstance(conf, (int, float)) else max(0.2, min(1.0, conf / 100.0))
+        return ROW_SPLIT_UNCONFIRMED_WEIGHT * frac
+    return 0.0
+
+
+def _dedupe_row_splits(anomalies: list[dict] | None) -> list[dict]:
+    """One entry per PHYSICAL row (table, page, block): two heuristics — or a report
+    that logged the same row twice — describing one broken row are one defect. The
+    most severe reading of that row is the one kept."""
+    best: dict[tuple, dict] = {}
+    for a in anomalies or []:
+        if a.get("action") not in _ROW_SPLIT_ACTIONS:
+            continue
+        loc = (a.get("table_id"), _stitch_page(a), a.get("block"))
+        if loc not in best or _row_split_severity(a) > _row_split_severity(best[loc]):
+            best[loc] = a
+    return list(best.values())
+
+
+def _row_split_penalty(anomalies: list[dict] | None) -> float:
+    """Severity-weighted, capped points for unresolved row splits (see ROW_SPLIT_POINTS)."""
+    return min(ROW_SPLIT_CAP,
+               ROW_SPLIT_POINTS * sum(_row_split_severity(a)
+                                      for a in _dedupe_row_splits(anomalies)))
+
+
+def _dedupe_by_key(findings: list[dict]) -> list[dict]:
+    """A finding reported twice under the same content-derived key is one defect."""
+    seen, out = set(), []
+    for f in findings:
+        k = f.get("key")
+        if k is not None and k in seen:
+            continue
+        seen.add(k)
+        out.append(f)
+    return out
+
+
+def _table_files(tree_dir: Path | None) -> dict[str, str]:
+    """table_id -> the tree file that holds it, from the MinerU badge line
+    ("**⚙ MinerU-extracted table** — table_011, pages 88–90, ..."). Lets a stitch
+    anomaly (which knows only its table) be matched to a source-fidelity finding (which
+    knows only its file)."""
+    out: dict[str, str] = {}
+    if not tree_dir or not Path(tree_dir).is_dir():
+        return out
+    for p in sorted(Path(tree_dir).rglob("*.md")):
+        try:
+            text = p.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        for m in re.finditer(r"\b(table_\d+),\s*pages?\b", text):
+            out.setdefault(m.group(1), str(p.relative_to(tree_dir)).replace("\\", "/"))
+    return out
+
+
+def _absorbed_by_row_splits(shape_defects: list[dict], splits: list[dict],
+                            table_files: dict[str, str]) -> list[dict]:
+    """The table-level symptom findings (see _ROW_SPLIT_SYMPTOM_KINDS) that a charged
+    row split in the SAME table already accounts for. Matched on file + page range; a
+    split whose table cannot be mapped to a file matches only when exactly one symptom
+    finding's page range holds its page, so an ambiguous match never absorbs anything."""
+    symptoms = [f for f in shape_defects if f.get("kind") in _ROW_SPLIT_SYMPTOM_KINDS
+                and f.get("pages")]
+    absorbed: dict[int, dict] = {}
+    for a in splits:
+        page = _stitch_page(a)
+        if page is None:
+            continue
+        in_range = [f for f in symptoms if min(f["pages"]) <= page <= max(f["pages"])]
+        file = table_files.get(a.get("table_id"))
+        hits = ([f for f in in_range if f.get("file") == file] if file
+                else in_range if len(in_range) == 1 else [])
+        for f in hits:
+            absorbed[id(f)] = f
+    return list(absorbed.values())
 
 
 def _load(path: Path):
@@ -1119,7 +1246,7 @@ def _score_fidelity(tables: list[dict], tpres: dict | None = None,
     # SCORED post-AI. What still counts either way: a table actually missing from the
     # CURRENT tree (checked against whichever stage `validate()` ran on — never stale),
     # and a row split across a page break (a Stage 2/3 stitching defect that Stage 4
-    # does not undo merely by existing — see ROW_SPLIT_PENALTY).
+    # does not undo merely by existing — see ROW_SPLIT_POINTS).
     earned = float(len(tables)) if stage else 0.0
     # NOT scored on cell-level grid damage, though it was briefly. check_table_cells
     # cannot currently locate a cell's own words on the page reliably enough to make
@@ -1154,24 +1281,24 @@ def _score_fidelity(tables: list[dict], tpres: dict | None = None,
         if t["table_id"] in lost_ids:
             earned -= 1.0 if stage else _table_credit(t)[0]
     # A row the stitcher could not safely rejoin after a page break (see
-    # ROW_SPLIT_PENALTY): every character survives, but the row is split across
-    # two adjacent <tr>s in the shipped tree. Only the unresolved ones count —
-    # "realigned_and_merged" / "widened_and_merged" means Stage 2 already put the
-    # row back together, so there is nothing left here to penalise.
-    row_splits = [a for a in (stitch_anomalies or [])
-                 if a.get("action") == "kept_as_separate_row"]
-    # The non-blank-leading-cell shape (see ROW_SPLIT_PENALTY_UNCONFIRMED): weaker
-    # evidence, so it costs less per occurrence rather than being ignored entirely.
-    unconfirmed_splits = [a for a in (stitch_anomalies or [])
-                          if a.get("action") == "unflagged_continuation"]
-    earned -= ROW_SPLIT_PENALTY * len(row_splits)
-    earned -= ROW_SPLIT_PENALTY_UNCONFIRMED * len(unconfirmed_splits)
-    return _clamp(100.0 * max(earned, 0.0) / len(tables)
-                  - _cell_defect_penalty(len(defects))), {
+    # ROW_SPLIT_POINTS): every character survives, but the row is split across two
+    # adjacent <tr>s in the shipped tree. Only the unresolved ones count —
+    # "realigned_and_merged" / "widened_and_merged" means Stage 2 already put the row
+    # back together, so there is nothing left here to penalise. The caller has already
+    # removed dismissed ones; deduplicated here per physical row.
+    splits = _dedupe_row_splits(stitch_anomalies)
+    row_splits = [a for a in splits if a.get("action") == "kept_as_separate_row"]
+    unconfirmed_splits = [a for a in splits if a.get("action") == "unflagged_continuation"]
+    split_points = _row_split_penalty(splits)
+    structure_points = min(FIDELITY_STRUCTURE_CAP,
+                           _cell_defect_penalty(len(defects)) + split_points)
+    return _clamp(100.0 * max(earned, 0.0) / len(tables) - structure_points), {
         "available": True, "tables_total": len(tables), "buckets": buckets,
         "tables_lost_after_extraction": len(lost),
         "rows_split_across_page_break": len(row_splits),
         "rows_possibly_split_unflagged": len(unconfirmed_splits),
+        "row_split_points": round(split_points, 2),
+        "structure_points": round(structure_points, 2),
         "stats": [
             {"label": "tables detected", "value": len(tables)},
             {"label": "clean geometric match", "value": buckets.get("confident", 0)},
@@ -1845,21 +1972,19 @@ def _collect_findings(cl: dict, ni: dict, tp: dict | None, tables: list[dict],
         })
     # A row split across a page break that Stage 2's stitcher (hybrid_extract.
     # stitch_table_html) tried to rejoin. Every occurrence is logged whether or not
-    # the rejoin succeeded — see ROW_SPLIT_PENALTY for why only the unresolved ones
+    # the rejoin succeeded — see ROW_SPLIT_POINTS for why only the unresolved ones
     # cost anything. `pages[block]` recovers the actual page: `pages` is the whole
     # table's page range and `block` is this row's offset into it, since the
     # stitcher checks exactly the first row of every page after the table's first.
     for a in (stage2 or {}).get("stitch_anomalies", []) or []:
-        a_pages = a.get("pages") or []
         block = a.get("block")
-        page = (a_pages[block] if isinstance(block, int) and 0 <= block < len(a_pages)
-               else None)
+        page = _stitch_page(a)
         preview = " ".join(a.get("row_text") or a.get("surplus_text") or [])[:160]
         quoted = f" The row: “{preview}…”" if preview else ""
         table_id = a.get("table_id")
         if a.get("action") == "kept_as_separate_row":
             out.append({
-                "key": dis.hierarchy_key(f"row-split-{table_id}-{page}-{block}"),
+                "key": _stitch_key(a),
                 "kind": "row_split", "dimension": "fidelity", "severity": "silent",
                 "file": None, "pages": [page] if page else [],
                 "title": f"{table_id} page {page}: one source row was rendered as two",
@@ -1880,11 +2005,11 @@ def _collect_findings(cl: dict, ni: dict, tp: dict | None, tables: list[dict],
             # sub-question label), so the blank-cell check above never even looked at
             # it — this is caught only because the previous row's own last cell stops
             # mid-sentence. Weaker evidence than row_split above (see
-            # ROW_SPLIT_PENALTY_UNCONFIRMED): a real split reads this way, but so can
+            # ROW_SPLIT_UNCONFIRMED_WEIGHT): a real split reads this way, but so can
             # a genuinely new row that happens to follow an answer ending mid-list, so
             # this is reported at lower confidence and costs less.
             out.append({
-                "key": dis.hierarchy_key(f"row-split-unflagged-{table_id}-{page}-{block}"),
+                "key": _stitch_key(a),
                 "kind": "row_split_unflagged", "dimension": "fidelity",
                 "severity": "silent",
                 "file": None, "pages": [page] if page else [],
@@ -1905,7 +2030,7 @@ def _collect_findings(cl: dict, ni: dict, tp: dict | None, tables: list[dict],
             # because a continuation merge is exactly the kind of automatic repair
             # worth a reviewer's eye even when it worked.
             out.append({
-                "key": dis.hierarchy_key(f"row-merge-{table_id}-{page}-{block}"),
+                "key": _stitch_key(a),
                 "kind": "row_continuation_merged", "dimension": "fidelity",
                 "severity": "advisory",
                 "file": None, "pages": [page] if page else [],
@@ -2254,6 +2379,32 @@ def compute_scorecard(out_root: Path, validation: dict | None = None,
     missing_answer_findings = [f for f in source_fidelity.get("findings", [])
                               if f.get("kind") == "missing_cell_answer" and not f["dismissed"]
                               and f.get("evidence", {}).get("confidence") != "advisory"]
+    # DETECTION vs SCORING. Everything above is detection: every finding stays in
+    # `findings`, dismissed or not, charged or not. What follows decides which of them
+    # cost points — only an active (not dismissed), non-duplicate instance does, and a
+    # table-level symptom already explained by a charged row split is not billed again.
+    boundary_leaks = _dedupe_by_key(boundary_leaks)
+    source_duplicates = _dedupe_by_key(source_duplicates)
+    missing_answer_findings = _dedupe_by_key(missing_answer_findings)
+    # Empty answer segments and row splits are built by _collect_findings above, so
+    # their dismissal state lives on those finding objects / their shared key.
+    empty_segment_count = len(_dedupe_by_key(
+        [f for f in findings if f["kind"] == "empty_answer_segment" and not f["dismissed"]]))
+    active_splits = _dedupe_row_splits(
+        [a for a in (stage2 or {}).get("stitch_anomalies", []) or []
+         if _stitch_key(a) not in dismissed_keys])
+    try:
+        _tree_dir = resolve_stage_dir(out_root, stage or 3)
+    except Exception:                                        # noqa: BLE001
+        _tree_dir = None
+    absorbed = _absorbed_by_row_splits(table_shape_defects, active_splits,
+                                       _table_files(_tree_dir))
+    for f in absorbed:
+        f["charged"] = False
+        f["absorbed_by"] = "row_split"
+    absorbed_ids = {id(f) for f in absorbed}
+    table_shape_defects = _dedupe_by_key([f for f in table_shape_defects
+                                          if id(f) not in absorbed_ids])
     cl_s, ni_s, tp_s, tables_s = _apply_dismissals(cl, ni, tp, tables, dismissed_keys)
     hier_s = _apply_census_dismissals(hier, dismissed_keys)
 
@@ -2278,14 +2429,14 @@ def compute_scorecard(out_root: Path, validation: dict | None = None,
         "completeness": _score_completeness(wc, cl_s, unread_silent, unread_flagged, n_pages,
                                            negation_flips, pcov, orphans=orphans,
                                            tcons=tcons,
-                                           empty_segment_count=len(empty_segments),
+                                           empty_segment_count=empty_segment_count,
                                            missing_answers=missing_answer_findings,
                                            source_cells_checked=source_cells_checked),
         "placement": _score_placement(tp_s, len(tables_s), hier,
                                       boundary_leaks=boundary_leaks,
                                       source_cells_checked=source_cells_checked),
         "fidelity": _score_fidelity(tables_s, tpres, tcells,
-                                    (stage2 or {}).get("stitch_anomalies"), stage,
+                                    active_splits, stage,
                                     shape_defects=table_shape_defects,
                                     source_cells_checked=source_cells_checked),
         "uniqueness": _score_uniqueness(wc, source_duplicates=source_duplicates,
@@ -2298,11 +2449,13 @@ def compute_scorecard(out_root: Path, validation: dict | None = None,
                                         _unchunked),
     }.items():
         dims[key] = {"score": score, "detail": detail, **HELP[key]}
+    if absorbed and isinstance(dims["fidelity"].get("detail"), dict):
+        dims["fidelity"]["detail"]["shape_findings_absorbed_by_row_split"] = len(absorbed)
     # `fidelity` used to be blanked out entirely on the post-AI re-score, because its
     # geometric bbox counts (see _score_fidelity's table-credit loop) are a re-skin of
     # Stage 2's IoU match, frozen before Stage 4 ever ran, and genuinely stale once the
     # tree has been rewritten. But the row-split terms in that same score
-    # (ROW_SPLIT_PENALTY / ROW_SPLIT_PENALTY_UNCONFIRMED) describe a Stage 2/3 STITCHING
+    # (ROW_SPLIT_POINTS / ROW_SPLIT_UNCONFIRMED_WEIGHT) describe a Stage 2/3 STITCHING
     # defect, not a Stage 4 one — whether a row was split across a page break has
     # nothing to do with what the AI pass did afterward, so blanking the whole
     # dimension hid a real, still-current defect behind a stale-bbox excuse that didn't
