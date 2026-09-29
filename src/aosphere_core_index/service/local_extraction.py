@@ -436,13 +436,26 @@ def _safe_segment_path(rel_path: str) -> str:
     return rel_path
 
 
-# The two local trees worth offering in the viewer's stage switcher. 02_stage2_mineru_tables
-# is deliberately not one of them: it holds per-table fragments (tables/<id>/table.html),
-# not a walkable section tree, so build_viewer (which walks a tree of .md files) has
-# nothing to build FROM there. Its content is already inlined into 03_stage3_final's
-# markdown by hybrid_extract.run_stage3, which is why opening the viewer already shows
-# MinerU's tables (rowspan/colspan intact, embedded as raw HTML) without a separate tab.
-_VIEWER_STAGE_DIRS = {1: "01_stage1_extract", 3: "03_stage3_final"}
+# The local trees worth offering in the viewer's stage switcher -- every stage that
+# is a walkable tree of .md files, same set as hybrid_extract_ui.py's own STAGE_DIRS,
+# minus Stage 1: raw pdf2mdtree output before MinerU's tables are folded in, not a
+# tree a reviewer asked to compare against. Every document with a Stage 1 tree also
+# has Stage 3 or later (confirmed against the local corpus), so dropping it here
+# loses no document's only tree.
+# 02_stage2_mineru_tables is deliberately not one of them either: it holds per-table
+# fragments (tables/<id>/table.html), not a walkable section tree, so build_viewer
+# (which walks a tree of .md files) has nothing to build FROM there. Its content is
+# already inlined into 03_stage3_final's markdown by hybrid_extract.run_stage3, which
+# is why opening the viewer already shows MinerU's tables (rowspan/colspan intact,
+# embedded as raw HTML) without a separate tab.
+#
+# 4 and 5 were missing here for a while after AI post-processing/sub-chunking were
+# added -- ensure_viewer's subtitle ("stages N/N/N") and its stage dict both come
+# from this SAME mapping, so a document that had genuinely been through Stage 4 and
+# 5 still only ever offered Stage 1/3 in the switcher, silently. build_viewer's
+# `stages` mechanism is generic (it just walks whatever directories it is given),
+# so no other change is needed to make 4/5 show up.
+_VIEWER_STAGE_DIRS = {3: "03_stage3_final", 4: "04_stage4_ai", 5: "05_subchunks"}
 
 
 def viewer_inputs_available(root: Path, product: str, label: str) -> bool:
