@@ -41,7 +41,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import lib_dismissals as dis
 import product_rules as pr
 from lib_content_compare import (BOLD, DIM, GREEN, RED, YELLOW, StageDirectoryNotFoundError,
-                                  banner, resolve_pdf, resolve_stage_dir, run_cli)
+                                  banner, parse_page_range, resolve_pdf, resolve_stage_dir,
+                                  run_cli)
 
 # A loss the reader can SEE in the output (a failure marker, a page snapshot, a
 # gap the file already acknowledges) still costs points — it is still missing
@@ -54,6 +55,14 @@ FLAGGED_WEIGHT = 0.25
 # document to REVIEW, two to FAIL — an inverted obligation must not be able to
 # pass, but a single one is a review item rather than an automatic rejection.
 NEGATION_FLIP_PENALTY = 15.0
+
+# A discrete, per-instance loss the same way a negation flip is — see
+# find_empty_answer_segments — but a smaller one: a dropped short boilerplate
+# answer ("N/a. Please see X above.") is a real gap, not an inverted legal
+# obligation, so it costs a fraction of what a negation flip does rather than
+# being ignored (the coverage-percentage term alone cannot see a handful of
+# missing words on a multi-thousand-word document).
+EMPTY_ANSWER_SEGMENT_PENALTY = 5.0
 
 # check_source_fidelity.py's cell-cited findings (section_boundary_leak,
 # duplicated_content, the table_shape_defects group, missing_cell_answer) are each
@@ -160,6 +169,27 @@ CREDIT_RECLASSIFIED = 1.0  # correctly identified as prose, not a table
 CREDIT_CONTINUATION = 0.75  # unverifiable only (multi-page table, no bbox)
 CREDIT_ABSORBED = 0.75      # content confirmed present, position not geometrically verified
 CREDIT_FAILED = FLAGGED_WEIGHT
+
+# A row Stage 2's own stitcher (hybrid_extract.stitch_table_html) could not safely
+# rejoin after a page break — every character survives, but the source's ONE row
+# now renders as two adjacent <tr>s, the second an orphan with an empty question
+# and an empty answer. Not a per-table credit loss like CREDIT_FAILED: nothing is
+# missing and the table may hold dozens of other, perfectly-stitched rows, so
+# scoring one page-break glitch like a whole failed table would drown it out.
+# A small fixed deduction per occurrence instead, similar order of magnitude to
+# the gap between CREDIT_CONFIDENT and CREDIT_UNCERTAIN.
+ROW_SPLIT_PENALTY = 0.15
+
+# A row hybrid_extract's stitcher couldn't even check for a continuation, because the
+# new page's leading cell already holds real text (usually the next sub-question's own
+# label) rather than the blank marker the check above looks for — see
+# TABLE_ROW_SPLIT_UNFLAGGED_CONTINUATION. The signal is the same "previous row ends
+# mid-sentence" evidence, but this shape hasn't been checked against the corpus the way
+# the blank-cell one has, and a length + not-a-heading filter still leaves real
+# false-positive risk (a genuinely new sub-section that happens to follow an answer
+# ending mid-list). Half the confirmed penalty: worth moving the score, not worth
+# treating as equally certain.
+ROW_SPLIT_PENALTY_UNCONFIRMED = 0.08
 
 # Explains every dimension in the UI: what it measures, where the number comes
 # from, what to do when it's low, and where it is still weak. Kept beside the
@@ -383,6 +413,103 @@ def _orphan_is_duplicate(block_text: str, tree_text: str) -> bool:
     return all(norm(x) in hay for x in sents)
 
 
+# A multi-part table cell holds several <br><br>-separated answers, one per
+# sub-question the paired question cell enumerates. The normal separator between
+# two populated segments is exactly one blank line — two <br> tags. Four or more
+# in a row means one or more of those segments is BLANK: content that belongs
+# between two real answers and isn't there.
+#
+# Measured on Cayman Islands__183333 p46, "7.1(i)": the question cell lists
+# seven sub-items (i)-(vii); the answer cell holds six "N/a. Please see 7.1(a)
+# above." segments and a bare <br><br><br><br> where the seventh — the one
+# paired with (iii) — should be. The word-coverage check never sees it: the
+# SAME six-word phrase already appears six times elsewhere in this exact cell,
+# so "is this text anywhere in the tree" is satisfied and the loss is invisible
+# to every check built on that question. This one asks a different question —
+# does the answer cell hold as many segments as the question cell asks for —
+# which is exactly what a repeated-boilerplate answer defeats for every other
+# check here. Corpus-wide: 1 file in 15 documents, zero false positives.
+_BLANK_SEGMENT_RE = re.compile(r"(?:<br\s*/?>\s*){4,}", re.I)
+_BR_TAG_RE = re.compile(r"<br\s*/?>", re.I)
+
+
+def _locate_page(pdf_path: Path | None, pages_range: tuple[int, int] | None,
+                 anchor_tokens: list[str]) -> int | None:
+    """Which page in `pages_range` actually holds `anchor_tokens` — reuses the
+    same per-page token index _readable_span builds, so a page found here is
+    exactly the page a readable-title lookup would also match against. Tries
+    every page in the file's own range rather than the +6 cap _readable_span
+    uses for a dropped SPAN's page: an empty-segment anchor is anchored to a
+    specific cell, wherever in a long section that cell happens to fall."""
+    if not anchor_tokens or not pdf_path or not pages_range:
+        return None
+    lo, hi = pages_range
+    for pno in range(lo, hi + 1):
+        got = _page_token_offsets(pdf_path, pno)
+        if not got:
+            continue
+        toks = [t for t, _s, _e in got[1]]
+        n = len(anchor_tokens)
+        for i in range(len(toks) - n + 1):
+            if toks[i:i + n] == anchor_tokens:
+                return pno
+    return None
+
+
+def find_empty_answer_segments(out_root: Path, stage: int | None) -> list[dict]:
+    try:
+        tree_dir = resolve_stage_dir(out_root, stage or 3)
+    except Exception:                                        # noqa: BLE001
+        return []
+    try:
+        pdf_path = resolve_pdf(out_root, None)
+    except Exception:                                        # noqa: BLE001
+        pdf_path = None
+    out = []
+    for p in sorted(tree_dir.rglob("*.md")):
+        try:
+            raw = p.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        file_pages = parse_page_range(raw)
+        for m in _BLANK_SEGMENT_RE.finditer(raw):
+            # Guard against a run that happens to straddle a cell/row boundary —
+            # <br> is cell content here and never a row separator in this
+            # pipeline's own HTML, but a defect elsewhere could make that false.
+            if "</td>" in m.group(0) or "<tr" in m.group(0):
+                continue
+            n_brs = len(_BR_TAG_RE.findall(m.group(0)))
+            empty_segments = n_brs // 2 - 1
+            if empty_segments < 1:
+                continue
+            before = re.sub(r"<[^>]+>", " ", raw[max(0, m.start() - 200):m.start()]).split()
+            after = re.sub(r"<[^>]+>", " ", raw[m.end():m.end() + 200]).split()
+            # Located on the source PDF the same way a readable-title quote is: the
+            # text right before the gap is tokenised the same way tokenize() would
+            # and matched against each candidate page's own token index. Without
+            # this the finding had no page at all (an empty `pages: []`), which is
+            # why it never appeared on the Page Review tab — everything else there
+            # is keyed by page number, so a finding with none is invisible there
+            # even though it still counts against the score.
+            anchor = [t.lower() for t in before[-8:] if re.match(r"^[A-Za-z0-9]", t)]
+            page = _locate_page(pdf_path, file_pages, anchor) if anchor else None
+            out.append({
+                "file": str(p.relative_to(tree_dir)).replace("\\", "/"),
+                "empty_segments": empty_segments,
+                "before": " ".join(before[-14:]),
+                "after": " ".join(after[:14]),
+                "page": page,
+                # The anchor is a strict contiguous token match, which a table cell's
+                # PDF reading order routinely breaks (columns extract in a different
+                # order than the markdown's row-major cells) — `page` comes back None
+                # more often here than for prose. Keep the file's own page range as a
+                # fallback so a pinpoint miss still puts the finding somewhere in Page
+                # Review instead of vanishing (see the "pages: []" note below).
+                "file_pages": list(file_pages) if file_pages else None,
+            })
+    return out
+
+
 def orphan_summary(stage2: dict | None, tree_text: str = "") -> dict:
     """Orphan tables, from the Stage 2 report: MinerU extracted them correctly and
     no placeholder claimed them.
@@ -428,6 +555,7 @@ def _score_completeness(wc: dict, cl: dict, unread_silent: int = 0, unread_flagg
                         unchunked: bool = False,
                         orphans: dict | None = None,
                         tcons: dict | None = None,
+                        empty_segment_count: int = 0,
                         missing_answers: list | None = None,
                         source_cells_checked: int | None = None) -> tuple[float, dict]:
     coverage = wc.get("coverage_adjusted_pct", 0.0)
@@ -483,6 +611,7 @@ def _score_completeness(wc: dict, cl: dict, unread_silent: int = 0, unread_flagg
              - 100.0 * (unread_silent / pages) * SILENT_WEIGHT
              - 100.0 * (unread_flagged / pages) * FLAGGED_WEIGHT
              - NEGATION_FLIP_PENALTY * negation_flips
+             - EMPTY_ANSWER_SEGMENT_PENALTY * empty_segment_count
              - _cell_defect_penalty(len(ma)))
     silent_spans = sum(len(r["dropped"]) for r in cl.get("results", []) if not r["acknowledged"])
     stats = [
@@ -527,6 +656,10 @@ def _score_completeness(wc: dict, cl: dict, unread_silent: int = 0, unread_flagg
     if negation_flips:
         stats.insert(0, {"label": "clauses that LOST a negation (meaning inverted)",
                          "value": negation_flips, "bad": True})
+    if empty_segment_count:
+        stats.insert(0, {"label": "answer segment(s) blank between two others "
+                                  "(repeated boilerplate hid the gap)",
+                         "value": empty_segment_count, "bad": True})
     if unread_silent or unread_flagged:
         stats.append({"label": "pages no text extractor can read",
                       "value": f"{unread_silent + unread_flagged} of {pages}",
@@ -564,6 +697,7 @@ def _score_completeness(wc: dict, cl: dict, unread_silent: int = 0, unread_flagg
         "files_with_silent_gap": silent_files,
         "files_with_flagged_gap": ack_files,
         "silent_spans": silent_spans,
+        "empty_answer_segments": empty_segment_count,
         "unreadable_silent_pages": unread_silent,
         "unreadable_flagged_pages": unread_flagged,
         "pages_missing": missing_pages,
@@ -661,7 +795,8 @@ def _norm_section_title(title: str) -> str:
 
 def _score_sectioning(cl: dict, hier: dict | None = None,
                       sp: dict | None = None,
-                      outl: dict | None = None) -> tuple[float | None, dict]:
+                      outl: dict | None = None,
+                      unchunked: bool = False) -> tuple[float | None, dict]:
     """Did the sections the tree PUBLISHES actually keep their own bodies?
 
     Nothing else here can answer that, which is the whole reason this exists.
@@ -768,9 +903,21 @@ def _score_sectioning(cl: dict, hier: dict | None = None,
     # the census rate keeps it, because that is the harsher denominator.
     census_missing_norm = {_norm_section_title(m.get("title") or "")
                            for m in census.get("missing", [])}
-    outline_total = (outl or {}).get("outline_count") or 0
-    outline_absent = [m for m in ((outl or {}).get("missing") or [])
-                      if _norm_section_title(m.get("title") or "") not in census_missing_norm]
+    # The raw-MinerU-markdown fallback tier (mineru_full_extract.RAW_MINERU_OUTPUT)
+    # writes ONE synthetic "heading" into headings_manifest.json — the PDF's own
+    # filename stem, standing in for a node the raw dump can live under, never a
+    # real section title (see that module's own comment: "it makes every
+    # per-section ratio meaningless"). Treated as a real outline entry here, that
+    # single placeholder can never "reach a heading in the tree" under its own
+    # name, so outline_lost/outline_total came out 1/1 and zeroed sectioning for
+    # every document this tier ever touches — Spain__138135: worst_score 0.0,
+    # weakest "sectioning", despite a cleanly divided 19-section tree. Skip the
+    # term entirely here, the same carve-out compute_scorecard already gives this
+    # tier everywhere else (see its own `_unchunked`).
+    outline_total = 0 if unchunked else ((outl or {}).get("outline_count") or 0)
+    outline_absent = [] if unchunked else [
+        m for m in ((outl or {}).get("missing") or [])
+        if _norm_section_title(m.get("title") or "") not in census_missing_norm]
     outline_lost = len(outline_absent) if ((outl or {}).get("available") and outline_total) else 0
 
     score = 100.0 - 100.0 * lost / denom - 100.0 * outline_lost / max(outline_total, 1)
@@ -941,21 +1088,21 @@ def _table_credit(t: dict) -> tuple[float, str]:
 
 
 def _score_fidelity(tables: list[dict], tpres: dict | None = None,
-                    tcells: dict | None = None, shape_defects: list | None = None,
+                    tcells: dict | None = None,
+                    stitch_anomalies: list[dict] | None = None,
+                    stage: int | None = None,
+                    shape_defects: list | None = None,
                     source_cells_checked: int | None = None) -> tuple[float | None, dict]:
     # A row/column-shape defect (inconsistent_table_columns, cell_split, row_merge,
     # column_merge, block_merge) answers this dimension's own question -- "were tables
     # extracted with the right structure?" -- at cell grain, cited against the source
-    # PDF, and is recomputed fresh against whichever tree is being audited. Unlike the
-    # bucket credit below (a re-skin of Stage 2's geometric bbox match, frozen before
-    # Stage 4 ever ran — see the post-stage nulling in compute_scorecard), this signal
-    # stays valid at every stage, so it is kept out of `earned`/`buckets` and applied
-    # as its own penalty, the same way boundary_leaks/source_duplicates apply to
-    # Placement/Uniqueness.
+    # PDF, and is recomputed fresh against whichever tree is being audited, so it is
+    # applied as its own flat penalty at every stage (see CELL_DEFECT_PENALTY) rather
+    # than folded into the per-table credit.
     defects = shape_defects or []
     shape_stat = {"label": "table cells with distorted rows/columns (source-cited)",
-                 "value": f"{len(defects)} of {source_cells_checked or 0}",
-                 "bad": len(defects) > 0}
+                  "value": f"{len(defects)} of {source_cells_checked or 0}",
+                  "bad": len(defects) > 0}
     if not tables:
         if not defects:
             return None, {"available": False, "reason": "no tables detected in this document"}
@@ -963,7 +1110,17 @@ def _score_fidelity(tables: list[dict], tpres: dict | None = None,
             "available": True, "tables_total": 0, "buckets": {},
             "tables_lost_after_extraction": 0, "stats": [shape_stat]}
     buckets: dict[str, int] = {}
-    earned = 0.0
+    # `stage` truthy means this is scoring the POST-AI tree. The geometric bbox credit
+    # below is Stage 2's own IoU match against MinerU's raw output, frozen before Stage
+    # 4 ever touched the tree — exactly the "stale and misleading as a METRIC" data the
+    # whole dimension used to be blanked out to avoid (see compute_scorecard). Give
+    # every table full credit here instead of re-deriving a stale bucket for it; the
+    # bucket is still computed and shown below (for a reviewer's eye), it just is not
+    # SCORED post-AI. What still counts either way: a table actually missing from the
+    # CURRENT tree (checked against whichever stage `validate()` ran on — never stale),
+    # and a row split across a page break (a Stage 2/3 stitching defect that Stage 4
+    # does not undo merely by existing — see ROW_SPLIT_PENALTY).
+    earned = float(len(tables)) if stage else 0.0
     # NOT scored on cell-level grid damage, though it was briefly. check_table_cells
     # cannot currently locate a cell's own words on the page reliably enough to make
     # the claim: it anchors on the cell's first and last few words and takes every
@@ -984,18 +1141,37 @@ def _score_fidelity(tables: list[dict], tpres: dict | None = None,
     # dimension scores what it did before.
     for t in tables:
         credit, bucket = _table_credit(t)
-        earned += credit
+        if not stage:
+            earned += credit
         buckets[bucket] = buckets.get(bucket, 0) + 1
     # A table Stage 2 extracted successfully but that never reached the tree is a
-    # total loss of that table, so it forfeits the credit already counted above.
+    # total loss of that table, so it forfeits the credit already counted above. Post-AI,
+    # every table STARTED at full (1.0) credit above, so a lost one gives up that same
+    # 1.0 rather than its stale stage-2 bucket credit.
     lost = [f for f in (tpres or {}).get("flags", [])]
     lost_ids = {f["table_id"] for f in lost}
     for t in tables:
         if t["table_id"] in lost_ids:
-            earned -= _table_credit(t)[0]
-    return _clamp(100.0 * max(earned, 0.0) / len(tables) - _cell_defect_penalty(len(defects))), {
+            earned -= 1.0 if stage else _table_credit(t)[0]
+    # A row the stitcher could not safely rejoin after a page break (see
+    # ROW_SPLIT_PENALTY): every character survives, but the row is split across
+    # two adjacent <tr>s in the shipped tree. Only the unresolved ones count —
+    # "realigned_and_merged" / "widened_and_merged" means Stage 2 already put the
+    # row back together, so there is nothing left here to penalise.
+    row_splits = [a for a in (stitch_anomalies or [])
+                 if a.get("action") == "kept_as_separate_row"]
+    # The non-blank-leading-cell shape (see ROW_SPLIT_PENALTY_UNCONFIRMED): weaker
+    # evidence, so it costs less per occurrence rather than being ignored entirely.
+    unconfirmed_splits = [a for a in (stitch_anomalies or [])
+                          if a.get("action") == "unflagged_continuation"]
+    earned -= ROW_SPLIT_PENALTY * len(row_splits)
+    earned -= ROW_SPLIT_PENALTY_UNCONFIRMED * len(unconfirmed_splits)
+    return _clamp(100.0 * max(earned, 0.0) / len(tables)
+                  - _cell_defect_penalty(len(defects))), {
         "available": True, "tables_total": len(tables), "buckets": buckets,
         "tables_lost_after_extraction": len(lost),
+        "rows_split_across_page_break": len(row_splits),
+        "rows_possibly_split_unflagged": len(unconfirmed_splits),
         "stats": [
             {"label": "tables detected", "value": len(tables)},
             {"label": "clean geometric match", "value": buckets.get("confident", 0)},
@@ -1008,6 +1184,10 @@ def _score_fidelity(tables: list[dict], tpres: dict | None = None,
              "value": buckets.get("continuation", 0)},
             {"label": "failed — flagged in output", "value": buckets.get("failed", 0),
              "bad": buckets.get("failed", 0) > 0},
+            {"label": "row split across a page break, not rejoined", "value": len(row_splits),
+             "bad": len(row_splits) > 0},
+            {"label": "row possibly split at a page break (lower confidence)",
+             "value": len(unconfirmed_splits), "warn": len(unconfirmed_splits) > 0},
             {"label": "extracted but LOST before the output", "value": len(lost),
              "bad": len(lost) > 0},
             # check_table_cells' own cell-location approach is still not scored here —
@@ -1198,6 +1378,121 @@ def _page_runs(pages: list[int], limit: int = 12) -> str:
     return ", ".join(out)
 
 
+# ---------------- human-readable quotes for a dropped/relocated token span --------
+# `gap` and `found_elsewhere` findings (below) title themselves with the raw tokens
+# lib_content_compare.tokenize() produced for the diff — lowercased, punctuation
+# collapsed to nothing ("Article 6(4)" -> "article", "6", "4"). Correct for the
+# comparison; unreadable as a quote, and NOT safe to fix at the source: tokenize()'s
+# own normalisation is calibrated across the whole validator suite (see its docstring
+# for two regressions a smaller change than this one caused). Reconstructed here
+# instead, purely for display: re-tokenize the cited PDF page with the SAME regex but
+# keep each match's character span, find the finding's own token run inside it, and
+# quote the untouched substring between those two offsets — real punctuation and
+# casing, because it never left the page.
+_READABLE_DOC_CACHE: dict[str, list[str] | None] = {}
+_READABLE_PAGE_CACHE: dict[tuple[str, int], tuple[str, list[tuple[str, int, int]]] | None] = {}
+
+
+def _cleaned_pages(pdf_path: Path) -> list[str] | None:
+    """Header/footer-stripped page texts (1-indexed, [0] a blank sentinel) — the
+    SAME pipeline lib_content_compare's own comparison tokenizes, reused rather
+    than re-detected so this lookup never disagrees with the diff it is explaining
+    about what counts as running text. Without this, a running header/footer
+    ("CONFIDENTIAL", a doc-control stamp, a page number) sits between the last
+    word of one page and the first of the next, and a span that crosses the page
+    break — as most do, page breaks falling wherever they fall — never matches as
+    contiguous. Cached per document: this reads every page once, needed or not,
+    so it must not repeat per finding."""
+    key = str(pdf_path)
+    if key in _READABLE_DOC_CACHE:
+        return _READABLE_DOC_CACHE[key]
+    result = None
+    try:
+        from lib_content_compare import (detect_boilerplate_patterns, page_band_lines,
+                                         pdf_page_texts, strip_boilerplate)
+        pages = pdf_page_texts(pdf_path)
+        band_lines = page_band_lines(pdf_path)
+        patterns, _detected = detect_boilerplate_patterns(pages, band_lines=band_lines)
+        result = strip_boilerplate(pages, patterns, band_lines=band_lines)
+    except Exception:                                       # noqa: BLE001
+        result = None
+    _READABLE_DOC_CACHE[key] = result
+    return result
+
+
+def _page_token_offsets(pdf_path: Path, pno: int):
+    """-> (cleaned page text, [(normalised token, start, end), ...]) or None.
+    Cached per (pdf, page): a document's findings routinely repeat a page."""
+    key = (str(pdf_path), pno)
+    if key in _READABLE_PAGE_CACHE:
+        return _READABLE_PAGE_CACHE[key]
+    result = None
+    pages = _cleaned_pages(pdf_path)
+    if pages and 1 <= pno < len(pages):
+        try:
+            from lib_content_compare import TOKEN_RE, _CURLY_APOSTROPHES, _LIGATURES
+            translated = pages[pno].translate(_LIGATURES).translate(_CURLY_APOSTROPHES)
+            offsets = [(m.group().lower().strip("-"), m.start(), m.end())
+                      for m in TOKEN_RE.finditer(translated)]
+            result = (translated, [o for o in offsets if o[0]])
+        except Exception:                                   # noqa: BLE001
+            result = None
+    _READABLE_PAGE_CACHE[key] = result
+    return result
+
+
+def _readable_span(pdf_path: Path | None, pages: list[int], tokens: list[str]) -> str | None:
+    if not tokens or not pages or pdf_path is None:
+        return None
+    lo, hi = min(pages), max(pages)
+    # A capped search window: the FILE's own page range (what `pages` actually holds
+    # here) can run to dozens of pages, but the dropped span itself is always a few
+    # sentences, so it is on one of the first several pages of that range or none.
+    combined: list[tuple[str, int, int, int]] = []          # (token, page, start, end)
+    for pno in range(lo, min(hi, lo + 6) + 1):
+        got = _page_token_offsets(pdf_path, pno)
+        if got:
+            combined.extend((t, pno, s, e) for t, s, e in got[1])
+    toks = [c[0] for c in combined]
+    n = len(tokens)
+    for i in range(len(toks) - n + 1):
+        if toks[i:i + n] != tokens:
+            continue
+        # Reconstruct verbatim, page by page, joined with a single space wherever
+        # the run itself crosses a page boundary (the two sides never share a
+        # sentence there once boilerplate is stripped, so a real space belongs).
+        parts, seg_page, seg_start = [], combined[i][1], combined[i][2]
+        for j in range(i, i + n):
+            _tok, pno, _s, e = combined[j]
+            if pno != seg_page:
+                text, _ = _page_token_offsets(pdf_path, seg_page)
+                parts.append(text[seg_start:combined[j - 1][3]])
+                seg_page, seg_start = pno, combined[j][2]
+        text, _ = _page_token_offsets(pdf_path, seg_page)
+        parts.append(text[seg_start:combined[i + n - 1][3]])
+        return " ".join(" ".join(p.split()) for p in parts if p.strip())
+    return None
+
+
+def _attach_readable_titles(findings: list[dict], out_root: Path) -> None:
+    """Rewrites a `gap`/`found_elsewhere` finding's token-join title with a real
+    quote wherever the cited page still turns up the same words. Leaves the title
+    exactly as it was (the plain token join) when the page can't be opened or the
+    run can't be relocated — never a worse or fabricated answer, just the old one."""
+    try:
+        pdf_path = resolve_pdf(out_root, None)
+    except Exception:                                        # noqa: BLE001
+        return
+    for f in findings:
+        if f["kind"] not in ("gap", "found_elsewhere") or not f.get("pages"):
+            continue
+        truncated = f["title"].endswith("…")
+        tokens = (f["title"][:-1] if truncated else f["title"]).split()
+        readable = _readable_span(pdf_path, f["pages"], tokens)
+        if readable:
+            f["title"] = readable + ("…" if truncated else "")
+
+
 # ---------------- individually dismissable findings ----------------
 def _collect_findings(cl: dict, ni: dict, tp: dict | None, tables: list[dict],
                       eng: dict | None = None, snapshotted: set | None = None,
@@ -1210,7 +1505,8 @@ def _collect_findings(cl: dict, ni: dict, tp: dict | None, tables: list[dict],
                       tcons: dict | None = None,
                       appx: dict | None = None,
                       outl: dict | None = None,
-                      pc: dict | None = None) -> list[dict]:
+                      pc: dict | None = None,
+                      empty_segments: list[dict] | None = None) -> list[dict]:
     """Every finding a reviewer can judge one-by-one, each with a content-derived
     key stable across re-extractions (see lib_dismissals). Aggregate signals
     (word coverage %, duplication rate) are deliberately NOT here: they are
@@ -1547,6 +1843,79 @@ def _collect_findings(cl: dict, ni: dict, tp: dict | None, tables: list[dict],
                          if o.get("removed_from") else "")
                       + ": " + (o.get("preview") or "")[:180],
         })
+    # A row split across a page break that Stage 2's stitcher (hybrid_extract.
+    # stitch_table_html) tried to rejoin. Every occurrence is logged whether or not
+    # the rejoin succeeded — see ROW_SPLIT_PENALTY for why only the unresolved ones
+    # cost anything. `pages[block]` recovers the actual page: `pages` is the whole
+    # table's page range and `block` is this row's offset into it, since the
+    # stitcher checks exactly the first row of every page after the table's first.
+    for a in (stage2 or {}).get("stitch_anomalies", []) or []:
+        a_pages = a.get("pages") or []
+        block = a.get("block")
+        page = (a_pages[block] if isinstance(block, int) and 0 <= block < len(a_pages)
+               else None)
+        preview = " ".join(a.get("row_text") or a.get("surplus_text") or [])[:160]
+        quoted = f" The row: “{preview}…”" if preview else ""
+        table_id = a.get("table_id")
+        if a.get("action") == "kept_as_separate_row":
+            out.append({
+                "key": dis.hierarchy_key(f"row-split-{table_id}-{page}-{block}"),
+                "kind": "row_split", "dimension": "fidelity", "severity": "silent",
+                "file": None, "pages": [page] if page else [],
+                "title": f"{table_id} page {page}: one source row was rendered as two",
+                "detail": (f"This row continues from the previous page "
+                          f"({a.get('previous_cells')} cell(s) there vs "
+                          f"{a.get('new_cells')} here), but no column alignment read "
+                          f"confidently enough ({a.get('confidence')}/100"
+                          + (f" — {a['reason']}" if a.get("reason") else "")
+                          + ") to rejoin it without risking fusing the wrong cells "
+                            "together, so it was kept as its own row instead of "
+                            "guessed at. Nothing is missing, but the tree now shows "
+                            "two adjacent rows where the source has one — the second "
+                            "with an empty question and an empty answer."
+                          + quoted),
+            })
+        elif a.get("action") == "unflagged_continuation":
+            # The new page's first row had its OWN non-empty leading cell (usually a
+            # sub-question label), so the blank-cell check above never even looked at
+            # it — this is caught only because the previous row's own last cell stops
+            # mid-sentence. Weaker evidence than row_split above (see
+            # ROW_SPLIT_PENALTY_UNCONFIRMED): a real split reads this way, but so can
+            # a genuinely new row that happens to follow an answer ending mid-list, so
+            # this is reported at lower confidence and costs less.
+            out.append({
+                "key": dis.hierarchy_key(f"row-split-unflagged-{table_id}-{page}-{block}"),
+                "kind": "row_split_unflagged", "dimension": "fidelity",
+                "severity": "silent",
+                "file": None, "pages": [page] if page else [],
+                "title": f"{table_id} page {page}: possible row split, unconfirmed",
+                "detail": ("The previous row's own last cell stops mid-sentence "
+                          f"(“…{a.get('previous_row_tail', '')[-120:]}”) and "
+                          "this row's leading cell already holds text of its own, so "
+                          "the usual blank-leading-cell continuation check never "
+                          "considered it. This READS like the same one-row-rendered-"
+                          "as-two defect, but nothing here rules out a genuinely new "
+                          "row that happens to follow an answer ending without a "
+                          f"period — confidence {a.get('confidence')}/100."
+                          + quoted),
+            })
+        else:
+            # realigned_and_merged / widened_and_merged: Stage 2 already put the row
+            # back together. Advisory only — same status as orphan_recovered above —
+            # because a continuation merge is exactly the kind of automatic repair
+            # worth a reviewer's eye even when it worked.
+            out.append({
+                "key": dis.hierarchy_key(f"row-merge-{table_id}-{page}-{block}"),
+                "kind": "row_continuation_merged", "dimension": "fidelity",
+                "severity": "advisory",
+                "file": None, "pages": [page] if page else [],
+                "title": f"{table_id} page {page}: continuation row rejoined "
+                        f"({a.get('action')})",
+                "detail": ("This row continued from the previous page and was "
+                          "automatically merged back into it — confirm the pairing "
+                          "reads correctly rather than fusing the wrong cells."
+                          + quoted),
+            })
     for x in (fn or {}).get("orphan_definitions", []):
         out.append({
             "key": dis.hierarchy_key("fn-orphan-" + str(x["id"])),
@@ -1604,6 +1973,32 @@ def _collect_findings(cl: dict, ni: dict, tp: dict | None, tables: list[dict],
             "detail": f"fitz {d['fitz_chars']} chars vs pypdf {d['pypdf_chars']}. Every "
                       "fitz-derived number for this page (coverage, gaps, numeric checks) is "
                       "unreliable here, because the extractor is built on fitz too.",
+        })
+    # A multi-part answer cell with a blank segment where a sub-question's own answer
+    # should be — see find_empty_answer_segments. Silent: the repeated boilerplate this
+    # always happens with ("N/a. Please see X above.") still appears elsewhere in the
+    # SAME cell, so nothing about the output hints that one copy of it is missing.
+    for e in empty_segments or []:
+        # A precise page hit stays a single page; a missed anchor (routine on table
+        # cells, whose PDF reading order scrambles a contiguous token match) falls
+        # back to the file's own page range rather than an empty list — an empty
+        # `pages` silently drops the finding everywhere Page Review is built from it
+        # (see find_empty_answer_segments), even though it is still an active,
+        # non-dismissed finding that counts against the score.
+        pages = [e["page"]] if e.get("page") else (e.get("file_pages") or [])
+        out.append({
+            "key": dis.hierarchy_key(f"empty-segment-{e['file']}-{e['before'][-40:]}"),
+            "kind": "empty_answer_segment", "dimension": "completeness", "severity": "silent",
+            "file": e["file"], "pages": pages,
+            "title": f"{e['file']}: {e['empty_segments']} answer segment(s) blank "
+                    "between two others",
+            "detail": ("This cell holds several blank-line-separated answers, one per "
+                      "sub-question in the paired question cell, and one of them is "
+                      "empty where the source has an answer — most often a repeated "
+                      "short boilerplate line ('N/a. Please see X above.') that still "
+                      "appears elsewhere in this SAME cell, so word coverage reads 100% "
+                      "and no other check sees the gap. "
+                      f"…{e['before']} ⟦MISSING⟧ {e['after']}…"),
         })
     return out
 
@@ -1802,6 +2197,7 @@ def compute_scorecard(out_root: Path, validation: dict | None = None,
         re.sub(r"<[^>]+>", " ", p.read_text(errors="ignore"))
         for p in sorted(out_root.glob("0*_*final*/*.md")))
     orphans = orphan_summary(stage2, _tree)
+    empty_segments = find_empty_answer_segments(out_root, stage)
     tcells = validation.get("table_cells") or {}
     tcons = validation.get("text_conservation") or {}
     pc = validation.get("page_coverage") or {}
@@ -1809,7 +2205,8 @@ def compute_scorecard(out_root: Path, validation: dict | None = None,
     outl = validation.get("outline_coverage") or {}
     findings = _collect_findings(cl, ni, tp, tables, eng, snapshotted, sem, hier,
                                 tpres, fnote, build_mismatch, stage2, orphans, tcells,
-                                tcons, appx, outl, pc)
+                                tcons, appx, outl, pc, empty_segments)
+    _attach_readable_titles(findings, out_root)
     source_fidelity = validation.get("source_fidelity") or {}
     findings.extend(source_fidelity.get("findings", []))
     for f in findings:
@@ -1880,39 +2277,38 @@ def compute_scorecard(out_root: Path, validation: dict | None = None,
     for key, (score, detail) in {
         "completeness": _score_completeness(wc, cl_s, unread_silent, unread_flagged, n_pages,
                                            negation_flips, pcov, orphans=orphans,
-                                           tcons=tcons, missing_answers=missing_answer_findings,
+                                           tcons=tcons,
+                                           empty_segment_count=len(empty_segments),
+                                           missing_answers=missing_answer_findings,
                                            source_cells_checked=source_cells_checked),
         "placement": _score_placement(tp_s, len(tables_s), hier,
                                       boundary_leaks=boundary_leaks,
                                       source_cells_checked=source_cells_checked),
-        "fidelity": _score_fidelity(tables_s, tpres, tcells, shape_defects=table_shape_defects,
+        "fidelity": _score_fidelity(tables_s, tpres, tcells,
+                                    (stage2 or {}).get("stitch_anomalies"), stage,
+                                    shape_defects=table_shape_defects,
                                     source_cells_checked=source_cells_checked),
         "uniqueness": _score_uniqueness(wc, source_duplicates=source_duplicates,
-                                       source_cells_checked=source_cells_checked),
+                                        source_cells_checked=source_cells_checked),
         "integrity": _score_integrity(ni_s, stage1, fnote),
         "ai_postprocess": _score_stage4(validation.get("stage4") or {}),
         "toc": _score_toc(validation.get("toc_quality") or {}),
         "sectioning": _score_sectioning(cl_s, hier_s,
-                                        validation.get("structure_profile") or {}, outl),
+                                        validation.get("structure_profile") or {}, outl,
+                                        _unchunked),
     }.items():
         dims[key] = {"score": score, "detail": detail, **HELP[key]}
-    # `fidelity`'s BUCKET score is a re-skin of Stage 2's geometric bbox match (see
-    # _score_fidelity), frozen before Stage 4 ever ran. That's fine for the extraction
-    # gate, but on the post-AI re-score (stage is truthy) it is stale and misleading as
-    # a METRIC — so it is blanked out here rather than gating or gradient-coloured, while
-    # the underlying counts (`detail`: buckets, tables lost, etc.) stay visible for a
-    # reviewer to read. See the matching exclusion from `critical` below.
-    #
-    # table_shape_defects is NOT part of that stale signal -- it is recomputed fresh
-    # against whichever tree this call is auditing, the same way boundary_leaks/
-    # source_duplicates stay valid for Placement/Uniqueness post-stage. When a genuine
-    # (non-advisory) shape defect exists, keep a score built from ONLY that reliable
-    # component instead of blanking the dimension outright.
-    if stage and dims.get("fidelity"):
-        if table_shape_defects:
-            dims["fidelity"]["score"] = _clamp(100.0 - _cell_defect_penalty(len(table_shape_defects)))
-        else:
-            dims["fidelity"]["score"] = None
+    # `fidelity` used to be blanked out entirely on the post-AI re-score, because its
+    # geometric bbox counts (see _score_fidelity's table-credit loop) are a re-skin of
+    # Stage 2's IoU match, frozen before Stage 4 ever ran, and genuinely stale once the
+    # tree has been rewritten. But the row-split terms in that same score
+    # (ROW_SPLIT_PENALTY / ROW_SPLIT_PENALTY_UNCONFIRMED) describe a Stage 2/3 STITCHING
+    # defect, not a Stage 4 one — whether a row was split across a page break has
+    # nothing to do with what the AI pass did afterward, so blanking the whole
+    # dimension hid a real, still-current defect behind a stale-bbox excuse that didn't
+    # apply to it. Scored post-AI now, stale bbox noise and all, because a document
+    # with a genuine unresolved row split showing a clean post-AI gate is the worse
+    # failure mode.
 
     # SHORT-DOCUMENT MODE (see SHORT_DOC_MAX_PAGES): a document too short to have a
     # structure is gated on word coverage alone. `toc` and `fidelity` are still
@@ -1925,8 +2321,7 @@ def compute_scorecard(out_root: Path, validation: dict | None = None,
     # Everywhere else it stays computed and displayed but advisory.
     sect_gates = pr.sectioning_gates(product)
     critical = tuple(k for k in CRITICAL_DIMENSIONS
-                     if (k != "sectioning" or sect_gates)
-                     and (k != "fidelity" or not stage or bool(table_shape_defects)))
+                     if (k != "sectioning" or sect_gates))
     gating_set = SHORT_DOC_DIMENSIONS if short_doc else critical
     special_mode = {
         "mode": "short_document",

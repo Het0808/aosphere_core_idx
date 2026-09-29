@@ -834,6 +834,22 @@ def blocks_to_prose(blocks, footnote_ids: frozenset = frozenset()):
 CONTINUATION_MERGE_MIN = 60
 _SENTENCE_END = frozenset('.;:!?"\u201d)]\u2019\'')
 
+# Guards for the non-blank-leading-cell continuation check below (see its own comment).
+# Measured against this corpus's own table.html files: an unfiltered "previous row
+# doesn't end in terminal punctuation" fires on the majority of multi-page tables,
+# almost all of it a short canned answer ("Yes", "No", "N/A") that simply has no
+# reason to carry a period \u2014 not a split. Requiring real length on the PREVIOUS row's
+# tail removes that noise; requiring the NEW row not look like a numbered heading
+# ("7.2 Sensitivities\u2026") removes the other repeat offender, a fresh sub-section that
+# only coincidentally follows an answer ending mid-list.
+MIN_UNFLAGGED_TAIL_WORDS = 10
+# A repeated "Questions"/"Answers" header row is occasionally NOT caught by the exact
+# key-equality dedup above (a stray formatting difference from the table's first
+# header), and a bare header is short — measured corpus-wide, every remaining false
+# positive after the tail-length filter was a 1-word header leaking through this way.
+MIN_UNFLAGGED_NEW_ROW_WORDS = 4
+_HEADING_START_RE = re.compile(r"^\d+\.\d+\s")
+
 
 def _ends_mid_sentence(text: str) -> bool:
     """True when the text simply stops, with no terminal punctuation to close it."""
@@ -1033,6 +1049,7 @@ def stitch_table_html(html_blocks, footnote_ids: frozenset = frozenset(),
         root = etree.HTML(block_html)
         if root is None:
             continue
+        block_started = False
         for ri, tr in enumerate(root.iter("tr")):
             cells = _tr_to_cells(tr, footnote_ids)
             if not cells or not any(c["text"] for c in cells):
@@ -1041,10 +1058,26 @@ def stitch_table_html(html_blocks, footnote_ids: frozenset = frozenset(),
             if header_key is None:
                 header_key = key
                 rows.append(cells)
+                block_started = True
                 continue
             if key == header_key:
-                continue  # repeated header on a later block
-            if bi > 0 and ri == 0 and rows and not cells[0]["text"]:
+                continue  # repeated header on a later block -- and NOT this block's
+                          # first row for the checks below: `ri` is the header's own
+                          # index (almost always 0), so testing `ri == 0` here passed
+                          # the header through as "the new page's first row" and left
+                          # the row actually after it -- the real continuation, at
+                          # ri == 1 -- looking like an ordinary mid-block row to both
+                          # checks below. Measured on Liechtenstein__180334 table_011
+                          # p88->89 and p89->90: both continuation rows have a blank
+                          # leading cell, the shape the FIRST check exists to catch,
+                          # and neither ever reached it because the repeated
+                          # "Questions"/"Answers" header sat at ri == 0 in front of
+                          # them. `block_started` tracks the block's first REAL row
+                          # instead, whatever `ri` it landed at.
+                continue
+            is_block_start = not block_started
+            block_started = True
+            if bi > 0 and is_block_start and rows and not cells[0]["text"]:
                 prev = rows[-1]
                 offset, lead = 0, []
                 if len(cells) > len(prev):
@@ -1055,7 +1088,14 @@ def stitch_table_html(html_blocks, footnote_ids: frozenset = frozenset(),
                             "new_cells": len(cells), "confidence": conf,
                             "signals": why,
                             "surplus_text": [c["text"] for c in cells[len(prev):]
-                                             if c["text"]]}
+                                             if c["text"]],
+                            # The row's OWN text, independent of where the surplus
+                            # column sits. surplus_text is empty whenever the real
+                            # content is at the LEADING edge (see _alignment_offset) —
+                            # a kept_as_separate_row outcome then has no text anywhere
+                            # in the anomaly for a reader to identify the orphaned row
+                            # by. This is what the scorecard finding quotes.
+                            "row_text": [c["text"] for c in cells if c["text"]]}
                     if conf >= CONTINUATION_MERGE_MIN:
                         offset, scored = _alignment_offset(prev, cells)
                         anom["alignment_offset"] = offset
@@ -1094,6 +1134,11 @@ def stitch_table_html(html_blocks, footnote_ids: frozenset = frozenset(),
                         continue
                     if anomalies_out is not None:
                         anomalies_out.append(anom)
+                # else: same width or narrower — a direct positional merge with no
+                # ambiguity to record (this is the overwhelmingly common shape a
+                # multi-page continuation takes and logging every instance drowns the
+                # findings that need an eye in ones that don't; see TABLE_ROW_SPLIT_*
+                # above for the shapes that DO get logged).
                 # Merge the aligned pairs into prev's OWN columns first, so the indices
                 # here are the ones _alignment_offset scored. Any unclaimed leading cell
                 # is prepended afterwards — doing it first would shift prev underneath
@@ -1115,6 +1160,45 @@ def stitch_table_html(html_blocks, footnote_ids: frozenset = frozenset(),
                 if lead:
                     prev[:0] = lead
                 continue
+            # The blank-leading-cell check above is the common shape (a marker column
+            # left empty on the continuation page), but MinerU does not always split a
+            # row that way — sometimes the FIRST cell of the new page's first row
+            # already holds real text (frequently the next sub-question's own label,
+            # e.g. "(ii) Do the national rules…"), so the check above never runs for
+            # it at all and the row is appended below with no record of anything.
+            # Measured on Liechtenstein__180334 p71->72: the previous row's answer
+            # cell ends "…such as the long distance distribution" and the very next
+            # sentence, "legislation for financial services…", lands entirely inside
+            # what looks like question (ii)'s own row instead — one source row
+            # rendered as two, same defect as TABLE_CONTINUATION_WIDER_ROW above,
+            # just without the shape that check looks for.
+            #
+            # Never merged here: unlike the blank-cell case, the new row has its own
+            # non-empty leading cell, so there is no single obvious "prepend" target —
+            # guessing which words belong to which row is exactly the corruption
+            # _alignment_offset exists to avoid. Detection only, logged at whatever
+            # confidence the shared signals give it (see _continuation_confidence);
+            # the caller decides from `confidence` how much weight this carries,
+            # because this shape has not been checked against the corpus the way the
+            # blank-cell path has.
+            if (bi > 0 and is_block_start and rows and cells[0]["text"]
+                    and len(rows[-1]) and _ends_mid_sentence(
+                        next((c["text"] for c in reversed(rows[-1]) if c["text"]), ""))):
+                tail = next((c["text"] for c in reversed(rows[-1]) if c["text"]), "")
+                new_row_words = sum(len(c["text"].split()) for c in cells)
+                if (len(tail.split()) >= MIN_UNFLAGGED_TAIL_WORDS
+                        and new_row_words >= MIN_UNFLAGGED_NEW_ROW_WORDS
+                        and not _HEADING_START_RE.match(cells[0]["text"])):
+                    conf, why = _continuation_confidence(rows[-1], cells, pages)
+                    if anomalies_out is not None:
+                        anomalies_out.append({
+                            "kind": "TABLE_ROW_SPLIT_UNFLAGGED_CONTINUATION",
+                            "table_id": meta.get("table_id"), "pages": pages,
+                            "block": bi, "confidence": conf, "signals": why,
+                            "action": "unflagged_continuation",
+                            "row_text": [c["text"] for c in cells if c["text"]],
+                            "previous_row_tail": tail[-200:],
+                        })
             rows.append(cells)
     if not rows:
         return None, 0, 0

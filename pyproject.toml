@@ -14,6 +14,13 @@ dependencies = [
     "pydantic-settings>=2.4",
     "rich>=13.7",
     "pyyaml>=6.0",
+    # Not a direct import here — floor exists so `uv sync`/`uv run` never downgrades it
+    # under requirements.txt's anyio/fastapi (installed separately, see README), which
+    # need `typing_extensions.sentinel` (added in 4.16). uv.lock has no visibility into
+    # requirements.txt, so without this floor every `uv run` silently reverts to
+    # whatever anyio-less resolution this project's own deps allow (4.15, no sentinel)
+    # and breaks the service on the next launch.
+    "typing_extensions>=4.16",
 ]
 
 [project.optional-dependencies]

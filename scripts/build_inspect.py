@@ -61,7 +61,7 @@ def _total_pages(job_dir: Path) -> int | None:
     if not p.exists():
         return None
     try:
-        return json.loads(p.read_text()).get("pages")
+        return json.loads(p.read_text(encoding="utf-8")).get("pages")
     except (OSError, json.JSONDecodeError):
         return None
 
@@ -75,8 +75,8 @@ def _tables_detail(job: dict, job_dir: Path) -> dict:
         if t.get("ok"):
             tdir = job_dir / "02_stage2_mineru_tables" / "tables" / t["table_id"]
             md_p, html_p = tdir / "table.md", tdir / "table.html"
-            d["table_md"] = md_p.read_text() if md_p.exists() else ""
-            d["table_html"] = html_p.read_text() if html_p.exists() else ""
+            d["table_md"] = md_p.read_text(encoding="utf-8") if md_p.exists() else ""
+            d["table_html"] = html_p.read_text(encoding="utf-8") if html_p.exists() else ""
         d["asset_urls"] = [f"/api/jobs/{JOB_ID}/assets/page-{p:03d}.png" for p in t["pages"]]
         out.append(d)
     return {"tables": out}
@@ -139,7 +139,7 @@ def _scorecards(job_dir: Path, job: dict) -> tuple[dict[str, dict], list[str], s
             sc = job.get("scorecard")
         else:
             try:
-                sc = json.loads((job_dir / SC_FILES[v]).read_text())
+                sc = json.loads((job_dir / SC_FILES[v]).read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
                 continue
         out[v] = {**(sc or {"gate": "unknown", "error": "scorecard not computed"}),
@@ -162,7 +162,7 @@ def _validations(job_dir: Path, job: dict) -> dict[str, dict]:
     p = job_dir / "validation_post_ai.json"
     if p.exists():
         try:
-            post = json.loads(p.read_text())
+            post = json.loads(p.read_text(encoding="utf-8"))
             post["view"] = "post_ai"
             out["post_ai"] = post
         except (OSError, ValueError):

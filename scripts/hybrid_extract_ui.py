@@ -145,7 +145,7 @@ CORPUS_ROOT: Path | None = None
 
 def _read_json(path: Path):
     try:
-        return json.loads(Path(path).read_text())
+        return json.loads(Path(path).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
 
@@ -207,13 +207,13 @@ def _corpus_jobs() -> list[dict]:
             if not meta_p.exists():
                 continue
             try:
-                meta = json.loads(meta_p.read_text())
+                meta = json.loads(meta_p.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
                 continue
             sc = None
             if sc_p.exists():
                 try:
-                    sc = json.loads(sc_p.read_text())
+                    sc = json.loads(sc_p.read_text(encoding="utf-8"))
                 except (OSError, json.JSONDecodeError):
                     sc = None
             # A document that went through AI post-processing is judged on what it NOW
@@ -230,7 +230,7 @@ def _corpus_jobs() -> list[dict]:
             post_p = d / "scorecard_post_ai.json"
             if post_p.exists():
                 try:
-                    post = json.loads(post_p.read_text())
+                    post = json.loads(post_p.read_text(encoding="utf-8"))
                 except (OSError, json.JSONDecodeError):
                     post = None
                 if post and post.get("gate") is not None:
@@ -318,7 +318,7 @@ def _corpus_tree() -> dict:
     prog = {}
     if CORPUS_ROOT and (CORPUS_ROOT / "_progress.json").exists():
         try:
-            prog = json.loads((CORPUS_ROOT / "_progress.json").read_text())
+            prog = json.loads((CORPUS_ROOT / "_progress.json").read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             prog = {}
     def _roll_up(node: dict, children: list[dict]) -> None:
@@ -415,7 +415,7 @@ def _load_corpus_artifacts(root: Path, job: dict) -> None:
         p = root / path
         if p.exists():
             try:
-                job[name] = json.loads(p.read_text())
+                job[name] = json.loads(p.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
                 pass
 
@@ -476,7 +476,7 @@ def _score_existing(job_id: str) -> None:
                            ("stage3_report", "03_stage3_final/stage3_report.json")):
             p = root / path
             if p.exists():
-                job[name] = json.loads(p.read_text())
+                job[name] = json.loads(p.read_text(encoding="utf-8"))
         job["status"] = "validate"
         job["validation"] = _run_validation(root)
         try:
@@ -760,7 +760,7 @@ def _build_tree(root: Path, job_id: str, rel: str = ""):
             node["dirs"].append(sub_node)
             files.update(sub_files)
         elif e.endswith(".md"):
-            text = full.read_text()
+            text = full.read_text(encoding="utf-8")
             text = re.sub(r"\]\((?:\.\./)*_assets/([^)]+)\)",
                           rf"](/api/jobs/{job_id}/assets/\1)", text)
             files[r] = text
@@ -814,7 +814,7 @@ def job_data(job_id: str, stage: int | None = None):
     stage1_report = Path(j["root"]) / "01_stage1_extract" / "stage1_report.json"
     if stage1_report.exists():
         try:
-            total_pages = json.loads(stage1_report.read_text()).get("pages")
+            total_pages = json.loads(stage1_report.read_text(encoding="utf-8")).get("pages")
         except (OSError, json.JSONDecodeError):
             pass
     return {"tree": tree, "files": files, "total_pages": total_pages,
@@ -889,8 +889,8 @@ def tables_detail(job_id: str):
         if t.get("ok"):
             tdir = root / "02_stage2_mineru_tables" / "tables" / t["table_id"]
             md_p, html_p = tdir / "table.md", tdir / "table.html"
-            d["table_md"] = md_p.read_text() if md_p.exists() else ""
-            d["table_html"] = html_p.read_text() if html_p.exists() else ""
+            d["table_md"] = md_p.read_text(encoding="utf-8") if md_p.exists() else ""
+            d["table_html"] = html_p.read_text(encoding="utf-8") if html_p.exists() else ""
         d["asset_urls"] = [f"/api/jobs/{job_id}/assets/page-{p:03d}.png" for p in t["pages"]]
         out.append(d)
     return {"tables": out}
@@ -915,7 +915,7 @@ def job_validation(job_id: str, view: str = "extraction"):
         p = Path(j["root"]) / "validation_post_ai.json"
         if p.exists():
             try:
-                out = json.loads(p.read_text())
+                out = json.loads(p.read_text(encoding="utf-8"))
                 out["view"] = "post_ai"
                 return out
             except (OSError, ValueError):
@@ -1137,7 +1137,7 @@ def _fresh_scorecard(j: dict, view: str = "extraction") -> dict | None:
     if j.get(mk) == mtime and sc is not None:
         return sc
     try:
-        sc = json.loads(p.read_text())
+        sc = json.loads(p.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return j.get(ck)
     j[ck], j[mk] = sc, mtime
@@ -1232,7 +1232,7 @@ def _recompute_scorecard(j: dict, view: str = "extraction") -> dict:
         p = root / "validation_post_ai.json"
         if p.exists():
             try:
-                validation_post_ai = json.loads(p.read_text())
+                validation_post_ai = json.loads(p.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
                 validation_post_ai = None
             j["scorecard_post_ai"] = compute_scorecard(root, validation_post_ai)
@@ -3093,6 +3093,11 @@ const PR_KIND_LABEL = {{
   fn_dangling: 'FOOTNOTE NO BODY', fn_orphan: 'FOOTNOTE NO MARKER',
   fn_duplicate: 'FOOTNOTE DUPLICATE', fn_gap: 'FOOTNOTE MISSING',
   engine: 'PARSER DISAGREEMENT',
+  empty_answer_segment: 'MISSING CONTENT', row_split: 'ROW SPLIT',
+  row_split_unflagged: 'ROW SPLIT (UNCONFIRMED)', row_continuation_merged: 'ROW MERGED',
+  row_merge: 'ROW MERGE', table_without_source_grid: 'TABLE NO SOURCE GRID',
+  section_boundary_leak: 'SECTION BOUNDARY LEAK', extraction_annotation: 'EXTRACTION ANNOTATION',
+  duplicated_content: 'DUPLICATED CONTENT', inconsistent_table_columns: 'INCONSISTENT COLUMNS',
 }};
 const PR_KIND_CLASS = {{
   gap: 'val-issue-red', gap_acknowledged: 'val-issue-amber',
@@ -3108,6 +3113,11 @@ const PR_KIND_CLASS = {{
   fn_dangling: 'val-issue-amber', fn_orphan: 'val-issue-amber',
   fn_duplicate: 'val-issue-amber', fn_gap: 'val-issue-amber',
   engine: 'val-issue-amber',
+  empty_answer_segment: 'val-issue-red', row_split: 'val-issue-red',
+  row_split_unflagged: 'val-issue-amber', row_continuation_merged: 'val-issue-amber',
+  row_merge: 'val-issue-red', table_without_source_grid: 'val-issue-red',
+  section_boundary_leak: 'val-issue-red', extraction_annotation: 'val-issue-amber',
+  duplicated_content: 'val-issue-amber', inconsistent_table_columns: 'val-issue-red',
 }};
 
 let pageIssuesData = {{}}, prFileRanges = [];

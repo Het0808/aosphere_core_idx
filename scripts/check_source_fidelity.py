@@ -451,6 +451,10 @@ def audit_source(pdf, tree):
             ts = tokens(body)
             if len(ts) >= 40:
                 bodies[tuple(ts)].append(chunk)
+            # Pipeline badges are useful provenance but must be visible as such.
+            if "MinerU-extracted table" in chunk["raw"]:
+                findings.append(finding("extraction_annotation", chunk["file"], list(chunk["pages"] or []),
+                    "Extractor metadata is included in the delivered chunk.", confidence="advisory"))
         full_source = " " + " ".join(t for page in page_tokens for t in page) + " "
         for body, copies in bodies.items():
             if len(copies) < 2:
