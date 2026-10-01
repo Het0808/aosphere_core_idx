@@ -69,6 +69,27 @@ def test_missing_short_answer_is_not_rescued_by_another_row():
     assert misses[0][1]['actual_occurrences'] == 0
 
 
+@pytest.mark.parametrize('pdf_answer,tree_answer', [
+    # Spain__176285 p57: the URL wraps mid-word, so the PDF reads "procedures22.p" / "df".
+    ('https://www.cnmv.es/DocPortal/IIC/UCITSandFIAsnotificationprocedures22.p\ndf',
+     'https://www.cnmv.es/DocPortal/IIC/UCITSandFIAsnotificationprocedures22.pdf'),
+    # Netherlands__156999 p26: a real hyphen falls at the line end and is joined away.
+    ('https://www.afm.nl/en/sector/aifm/aanmelden-of-afmelden-europees-\npaspoort.',
+     'https://www.afm.nl/en/sector/aifm/aanmelden-of-afmelden-europees-paspoort.'),
+])
+def test_an_answer_broken_across_pdf_lines_is_not_missing(pdf_answer, tree_answer):
+    src = [cell(A), cell(pdf_answer, col=1)]
+    out = [cell(A), cell(tree_answer, col=1)]
+    assert missing_answers(src, out) == []
+
+
+def test_line_wrap_tolerance_still_binds_to_whole_words():
+    # "No" must not be found inside "not" / "cannot" just because spaces are ignored.
+    src = [cell(A), cell('No.', col=1)]
+    out = [cell(A), cell('It is not possible and cannot be done', col=1)]
+    assert missing_answers(src, out)[0][1]['actual_occurrences'] == 0
+
+
 def test_repeated_answer_multiplicity_in_a_merged_row():
     answer = 'N/a. Please see 7.1(a) above.'
     src = [cell(A), cell(answer, col=1), cell(B, row=1), cell(answer, row=1, col=1)]
@@ -271,7 +292,7 @@ def test_a_pile_up_of_shape_defects_is_capped_not_unbounded(tmp_path):
     assert report['dimensions']['fidelity']['score'] == 90.0       # 100 - min(15,10)*1.0
 
 
-@pytest.mark.parametrize('kind', ['row_alignment', 'table_as_text'])
+@pytest.mark.parametrize('kind', ['row_alignment', 'table_as_text', 'prose_as_table'])
 def test_the_other_table_shape_kinds_also_cost_fidelity(tmp_path, kind):
     """row_alignment and table_as_text share compare_grid's cell-boundary-disagreement
     template with inconsistent_table_columns/cell_split/row_merge/column_merge/

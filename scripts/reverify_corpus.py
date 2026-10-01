@@ -45,17 +45,6 @@ def jobs(product: str | None, job: str | None, corpus: Path = CORPUS) -> list[Pa
     return [p.parent for p in sorted(corpus.glob(pat))]
 
 
-def is_summary_ai(dest: Path) -> bool:
-    """A summary-AI job writes its tree straight into 04_stage4_ai/ and has no 03_* tree.
-    run_and_gate scores stage 3 by default, so re-scoring one here finds nothing to read
-    and reports a false completeness 0.0 / fail — scripts/backfill_post_ai_scorecard.py
-    scores these at their real stage instead."""
-    if (dest / "summary_ai_rule.json").exists():
-        return True
-    return (next(iter(dest.glob("03_*")), None) is None
-            and next(iter(dest.glob("04_*")), None) is not None)
-
-
 def reverify(dest: Path, write: bool) -> dict:
     """-> {job, before, after, moved}. Never re-extracts; scores what is on disk."""
     old = json.loads((dest / "scorecard.json").read_text())
@@ -111,11 +100,6 @@ def main() -> None:
         before = len(todo)
         todo = [d for d in todo if (d / "scorecard.json").stat().st_mtime < cutoff]
         print(f"  skipping {before - len(todo)} job(s) already re-scored", flush=True)
-    summary_ai = [d for d in todo if is_summary_ai(d)]
-    if summary_ai:
-        todo = [d for d in todo if d not in summary_ai]
-        print(f"  skipping {len(summary_ai)} summary-AI job(s) (no stage-3 tree) — score "
-              f"them with scripts/backfill_post_ai_scorecard.py", flush=True)
     if args.limit:
         todo = todo[:args.limit]
     if not todo:

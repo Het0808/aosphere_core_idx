@@ -115,6 +115,11 @@ HOLLOW_MIN_BODY = 150       # source tokens between this heading and the next
 # present but never contiguous, and an exact-substring probe misses it (it missed
 # 8.10, whose 1,347-token body is plainly inside 8.8's table).
 HOLLOW_ATTRIB_RATIO = 0.6
+# A section that declares its pages as snapshots is hollow only if another file holds at
+# least this share of its body -- stricter than HOLLOW_ATTRIB_RATIO, because a snapshot
+# declaration is the pipeline saying "I could not extract this", and that is only wrong
+# when the extracted text is demonstrably sitting elsewhere in the tree.
+HOLLOW_SNAPSHOT_MIN_ABSORBED = 0.9
 
 # ---- restructured content: tables and footnotes --------------------------
 #
@@ -1064,10 +1069,20 @@ def compute_content_localized(out_root: Path, pdf: str | None = None, stage: int
         # in the first place. Neither is a section whose content went under the wrong
         # heading, which is the only thing this finding is allowed to mean.
         acknowledged = has_flagged_gap_marker(entry["raw"])
-        if own_slice is not None and not _declares_snapshot_pages(entry["raw"]):
+        if own_slice is not None:
             h = _hollow_finding(rel, (a, b), own_slice, md_tokens, file_tokens,
                                 source_hay)
-            if h:
+            # The exemption above holds only while the snapshots are the content's
+            # LAST resort. When another file holds (nearly) all of the section's body,
+            # the pages were not unextractable -- the table was extracted and filed
+            # under the wrong heading, and the snapshots are just what was left behind
+            # (Spain__176285, Norway__171186: "10 LICENCE" is snapshots only while its
+            # whole 26-row table sits at the end of "9 PROSPECTUS REGULATION"). Measured
+            # over 29 documents this adds exactly those two findings, and the
+            # all-snapshot sections the exemption was written for (Bermuda "5 Passive
+            # Marketing") have no holder, so they stay exempt.
+            if h and (not _declares_snapshot_pages(entry["raw"])
+                      or h["absorbed_ratio"] >= HOLLOW_SNAPSHOT_MIN_ABSORBED):
                 hollow.append(h)
 
         if not (dropped or relocated or present_elsewhere or restructured or changed):

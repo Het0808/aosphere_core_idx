@@ -18,6 +18,12 @@ from lib_content_compare import (clean_markdown, parse_page_range, resolve_pdf,
                                  resolve_stage_dir, tokenize)
 
 
+# A PDF cell shorter than this is not matched against the output at all (merge / split /
+# row-alignment checks). Cells are matched by runs of four consecutive words, so 4 is the
+# smallest value the matching can use.
+MIN_CELL_TOKENS = 8
+
+
 def tokens(text):
     # Join PDF line-end hyphenation; normalize typography on BOTH sides.
     text = re.sub(r"(\w)-\s*\n\s*(\w)", r"\1\2", text)
@@ -202,7 +208,7 @@ def compare_grid(source, output):
             output_index[sh].add(j)
     for i, src in enumerate(source):
         ts = src["tokens"]
-        if len(ts) < 8:
+        if len(ts) < MIN_CELL_TOKENS:
             continue
         votes = Counter(j for sh in shingles(ts) for j in output_index.get(sh, ()))
         candidates = [j for j, _ in votes.most_common(12)]
@@ -265,6 +271,158 @@ def compare_grid(source, output):
     return flags, mapped
 
 
+def _compact(ts):
+    return "".join(ts).replace("-", "")
+
+
+def _count_wrapped(hay, phrase):
+    """Occurrences of `phrase` in `hay` that start and end on token boundaries, compared
+    with spaces and hyphens removed.
+
+    A PDF cell breaks text at the line end, and a URL breaks anywhere: the tokenizer then
+    reads "...procedures22.p\\ndf" as "procedures22 p df" (Spain__176285 p57) and, joining
+    what it takes for a hyphenated line break, "europees-\\npaspoort" as "europeespaspoort"
+    (Netherlands__156999 p26), while the tree holds the same URL unbroken. Exact token
+    matching counted both answers missing. Boundaries still bind, so a short answer
+    ("No") never matches inside a longer word ("not", "cannot")."""
+    target = _compact(phrase)
+    if not target:
+        return 0
+    n = 0
+    for i in range(len(hay)):
+        s = ""
+        for tok in hay[i:]:
+            s += tok.replace("-", "")
+            if len(s) >= len(target):
+                n += s == target
+                break
+    return n
+
+
+_QUOTE_SWAPS = (("\u2019", "'"), ("'", "\u2019"), ("\u201c", '"'), ('"', "\u201c"),
+                ("\u201d", '"'), ('"', "\u201d"))
+
+
+def _first_rect(page, text, words=6):
+    """Where the opening words of a cell's text are printed on the PDF page, or None.
+
+    The tree normalises typography ("Counsel's" with a straight quote) that the PDF prints
+    curled, so a failed search is retried with the quote styles swapped."""
+    ws = re.sub(r"\s+", " ", text or "").strip().split(" ")
+    for k in (words, 4, 3):
+        if not ws or not ws[0]:
+            return None
+        phrase = " ".join(ws[:k])
+        variants = [phrase] + [phrase.replace(a, b) for a, b in _QUOTE_SWAPS if a in phrase]
+        for v in variants:
+            hits = page.search_for(v)
+            if hits:
+                return hits[0]
+    return None
+
+
+def _side_by_side(left, right):
+    height = min(left.height, right.height) or 1
+    overlap = min(left.y1, right.y1) - max(left.y0, right.y0)
+    return right.x0 >= left.x1 - 2 and overlap >= 0.4 * height
+
+
+def layout_verdict(page, cells):
+    """How the PDF page lays out the text of ONE output table: "columns", "prose" or "unknown".
+
+    A table in the output is a claim that the page has columns. On a page with no ruled
+    grid, "columns" is true when the cells of a row are printed side by side (a borderless
+    table: term | definition) and "prose" when they are not -- the text of the second cell
+    starts BELOW the first and from the same left margin (a heading with its paragraphs),
+    which is an invented structure, not the document's. Judged only from the first words of
+    each cell, so a long paragraph that wraps cannot be mistaken for a column.
+
+    "unknown" -- no pair of neighbouring cells could be located -- is never called prose."""
+    rows = defaultdict(list)
+    for c in cells:
+        if (c.get("text") or "").strip():
+            rows[c["row"]].append(c)
+    located = 0
+    for cs in rows.values():
+        rects = [_first_rect(page, c["text"]) for c in sorted(cs, key=lambda c: c["col"])]
+        for a, b in zip(rects, rects[1:]):
+            if a is None or b is None:
+                continue
+            located += 1
+            if _side_by_side(a, b):
+                return "columns"
+    return "prose" if located else "unknown"
+
+
+MERGE_KINDS = ("row_merge", "column_merge", "block_merge")
+
+
+def _span(values):
+    v = sorted({x + 1 for x in values})            # 1-based, as the finding text reads
+    return f"{v[0]}" if len(v) == 1 else f"{v[0]}\u2013{v[-1]}"
+
+
+def label_flags(flags, source):
+    """(tag, explanation) for each flag of ONE source table, or (None, None) to keep the
+    generic wording. Presentation only: the flag's kind, evidence and cost are untouched.
+
+    The detector reports where the pieces of a PDF cell ended up. What a reader needs is
+    WHAT happened to the table, and the names it used (row_merge / column_merge) described
+    the direction of the merge, not its size:
+
+      SPLIT_CELL   one PDF cell came out as several cells;
+      MERGED_CELL  several PDF cells came out as one cell -- stacked in a column
+                   (row_merge), side by side in a row (column_merge) or a block of both;
+      MERGED_ROW   the same PDF rows were merged in two or more columns at once, i.e. the
+                   whole row structure collapsed, not a single cell.
+
+    A lone stacked merge leaves the rest of its rows intact (Botswana__183055 p26: the
+    "(A)/(B)/(C)" cells of one column share one output cell, the answers beside them
+    untouched), so calling it a merged ROW overstated it."""
+    cols_merged = defaultdict(set)         # the set of source rows merged -> columns it happened in
+    for kind, ids, _dests in flags:
+        if kind in MERGE_KINDS:
+            rows = frozenset(source[i]["row"] for i in ids)
+            if len(rows) >= 2:
+                cols_merged[rows].update(source[i]["col"] for i in ids)
+
+    def whole_rows(rows):
+        """Were these rows merged in EVERY column that holds text the detector can see?
+        Two merged columns of a three-column table leave the third intact: two merged
+        cells, not a collapsed row. Overstating is the error to avoid, so a column whose
+        cells are too short to be matched (an answer of "No.") does not count against it."""
+        merged = cols_merged.get(frozenset(rows), set())
+        seen = {c["col"] for c in source if c["row"] in rows
+                and len(c.get("tokens") or [None] * MIN_CELL_TOKENS) >= MIN_CELL_TOKENS}
+        return len(merged) >= 2 and seen <= merged
+
+    out = []
+    for kind, ids, _dests in flags:
+        rows = {source[i]["row"] for i in ids}
+        cols = {source[i]["col"] for i in ids}
+        if kind == "cell_split":
+            out.append(("SPLIT_CELL", "SPLIT_CELL \u2014 one cell in the PDF was split across "
+                        "several cells in the exported table."))
+        elif kind in MERGE_KINDS and len(rows) >= 2 and whole_rows(rows):
+            out.append(("MERGED_ROW", f"MERGED_ROW \u2014 the whole row structure was merged: "
+                        f"PDF rows {_span(rows)} were combined into one row (columns "
+                        f"{_span(cols_merged[frozenset(rows)])} are each merged across those rows)."))
+        elif kind == "row_merge":
+            out.append(("MERGED_CELL", f"MERGED_CELL \u2014 {len(ids)} separate cells (rows "
+                        f"{_span(rows)} of column {_span(cols)}) were merged into one cell. The rest "
+                        "of those rows is intact, so this is a merged cell, not a merged row."))
+        elif kind == "column_merge":
+            out.append(("MERGED_CELL", f"MERGED_CELL \u2014 cell spans/merges across columns: "
+                        f"{len(ids)} separate cells (columns {_span(cols)} of row {_span(rows)}) "
+                        "were merged into one cell."))
+        elif kind == "block_merge":
+            out.append(("MERGED_CELL", f"MERGED_CELL \u2014 a block of {len(ids)} cells (rows "
+                        f"{_span(rows)}, columns {_span(cols)}) was merged into one cell."))
+        else:
+            out.append((None, None))
+    return out
+
+
 def missing_answers(source, output):
     """Count short answers in the output row anchored by their source question.
 
@@ -292,8 +450,7 @@ def missing_answers(source, output):
                         and o["row"] <= row < o["row"]+o["rowspan"] and o["col"] >= answer_col]
         counts = Counter(tuple(s["tokens"]) for s in expected)
         for phrase, count in counts.items():
-            actual = sum(sum(tuple(o["tokens"][i:i+len(phrase)]) == phrase
-                             for i in range(len(o["tokens"])-len(phrase)+1)) for o in answer_cells)
+            actual = sum(_count_wrapped(o["tokens"], phrase) for o in answer_cells)
             if actual < count:
                 missing.append((file, {"source_answer": " ".join(phrase), "expected_occurrences": count,
                                        "actual_occurrences": actual, "output_table": table, "output_row": row}))
@@ -324,6 +481,7 @@ def audit_source(pdf, tree):
     if not chunks:
         return {"passed": False, "error": "No Markdown chunks found", "findings": []}
     findings, source_tables, unchecked = ragged_tables(output), 0, []
+    prose_tables = defaultdict(list)
     matched_cells, source_cells = 0, 0
     with fitz.open(str(pdf)) as doc:
         anchors = heading_anchors(doc, chunks)
@@ -344,7 +502,7 @@ def audit_source(pdf, tree):
                         if text and box:
                             src.append({"row": ri, "col": ci, "text": text,
                                         "tokens": tokens(text), "bbox": list(box)})
-                substantive = [s for s in src if len(s["tokens"]) >= 8]
+                substantive = [s for s in src if len(s["tokens"]) >= MIN_CELL_TOKENS]
                 if not substantive:
                     continue
                 source_tables += 1
@@ -355,11 +513,18 @@ def audit_source(pdf, tree):
                     findings.append(finding("missing_cell_answer", file, [pno],
                         "A short answer is missing from its question's output row, even if it occurs elsewhere.",
                         source_table=ti, **evidence))
-                for kind, ids, dests in flags:
-                    findings.append(finding(kind, local_output[dests[0]]["file"], [pno],
-                        "PDF cell boundaries disagree with the exported table; inspect the cited cells.",
+                labels = label_flags(flags, src)
+                for (kind, ids, dests), (tag, why) in zip(flags, labels):
+                    f = finding(kind, local_output[dests[0]]["file"], [pno],
+                        why or "PDF cell boundaries disagree with the exported table; inspect the cited cells.",
                         source_table=ti, source_cells=[{k: src[i][k] for k in ("row", "col", "text", "bbox")} for i in ids],
-                        output_cells=[{k: local_output[j][k] for k in ("row", "col", "table", "text")} for j in dests]))
+                        output_cells=[{k: local_output[j][k] for k in ("row", "col", "table", "text")} for j in dests])
+                    if tag:
+                        # Set AFTER the key is derived: the key hashes kind/file/pages/evidence
+                        # only, so a reviewer's dismissal of this finding keeps matching it.
+                        f["tag"] = tag
+                        f["title"] = tag.replace("_", " ").lower()
+                    findings.append(f)
                 boundary_matches = []
                 for i, s in enumerate(src):
                     if len(s["tokens"]) < 12:
@@ -436,14 +601,29 @@ def audit_source(pdf, tree):
                     break
             if not tables:
                 groups = defaultdict(list)
+                every_cell = defaultdict(list)
                 for cell in local_output:
+                    every_cell[cell["file"], cell["table"]].append(cell)
                     if len(cell["tokens"]) >= 8 and coverage(cell["tokens"], page_tokens[pno-1]) >= .9:
                         groups[cell["file"], cell["table"]].extend(cell["tokens"])
                 for (file, table), body in groups.items():
                     if len(body) >= 40:
-                        findings.append(finding("table_without_source_grid", file, [pno],
-                            "The output uses a table where the PDF has no detected ruled grid. Review for prose converted into a table.",
-                            output_table=table, confidence="advisory"))
+                        if layout_verdict(page, every_cell[file, table]) == "prose":
+                            prose_tables[file, table].append(pno)
+                        else:
+                            findings.append(finding("table_without_source_grid", file, [pno],
+                                "The output uses a table where the PDF has no detected ruled grid. Review for prose converted into a table.",
+                                output_table=table, confidence="advisory"))
+        # Prose rendered as a table, once per TABLE: a summary that runs ten pages is one
+        # wrong structure, and is listed on each of those pages by its page range.
+        for (file, table), pages_hit in sorted(prose_tables.items()):
+            lo, hi = min(pages_hit), max(pages_hit)
+            findings.append(finding("prose_as_table", file, [lo, hi],
+                "The PDF prints this as ordinary headings and paragraphs"
+                f" (page{'s' if hi > lo else ''} {lo}\u2013{hi}: no ruled grid and no side-by-side columns), "
+                "but the exported chunk lays it out as a table, with the headings in one cell and their text "
+                "in another. The words are all there; the table structure is invented.",
+                output_table=table, pages_checked=pages_hit))
         # Duplicate whole bodies, verified against occurrence counts in the source.
         bodies = defaultdict(list)
         for chunk in chunks:

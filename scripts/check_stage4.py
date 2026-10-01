@@ -170,15 +170,6 @@ def _file_removals(report: dict, fname: str) -> list[str]:
     return out
 
 
-# The stage-3-vs-stage-4 exactness flags that only `batched` mode promises to satisfy.
-# Section mode records every one of these as "reported, not enforced" (see
-# ai_postprocess.accept_section), so for it they are evidence to show, not failures.
-_BATCHED_ONLY_KINDS = frozenset({
-    "content_added", "content_removed_unexplained", "removal_overdeclared",
-    "removal_not_duplicated", "row_content_drift", "markup_injected",
-})
-
-
 def compute_stage4(out_root: Path) -> dict:
     out_root = Path(out_root)
     s3 = next(iter(sorted(out_root.glob("03_*"))), None)
@@ -313,49 +304,11 @@ def compute_stage4(out_root: Path) -> dict:
                       "detail": f"rows matching their table width fell "
                                 f"{uni_b:.0%} -> {uni_a:.0%}"})
 
-    # Section mode (run_stage4's default) has a different contract from `batched`, and
-    # scoring it against batched's was why every section-mode document read
-    # ai_postprocess 0.0: section mode reads each section's page images and is ALLOWED
-    # to add text stage 3 missed, drop content of other sections stage 1 dragged in, and
-    # emit headings/emphasis — ai_postprocess.accept_section records all of that as
-    # "reported, not enforced". The character-exact flags above can therefore never be
-    # clean for it, and any one of them zeroed the score, so 0.0 said "section mode ran",
-    # not "section mode damaged the document". The flags are kept (demoted to warnings,
-    # tagged with the contract they break) so the diff stays auditable; the score is the
-    # section-mode question — did any stage-3 cell leave the document, or change side of
-    # its table — the same integrity_score the Stage 4 tab already shows. Whether added
-    # text is actually in the PDF is answered by the post-AI tree-vs-PDF checks
-    # (uniqueness, completeness, source_fidelity at the scored stage), not here.
-    section_mode = report.get("mode") == "section"
-    if section_mode:
-        for f in flags:
-            if f["severity"] == "critical" and f["kind"] in _BATCHED_ONLY_KINDS:
-                f["severity"] = "warning"
-                f["contract"] = "batched"
-        cons = conservation_report(out_root)
-        for m in cons["missing_cells"]:
-            split = m.get("likely") == "split"
-            flags.append({"severity": "warning" if split else "critical",
-                          "kind": "cell_split_across_chunks" if split else "cell_missing",
-                          "file": m["file"],
-                          "detail": f"{m['role']} cell ({m['chars']} chars) not found whole "
-                                    f"in stage 4 — {m['windows_found']}/{m['windows']} "
-                                    "40-char windows present"})
-        for m in cons["moved_cells"]:
-            flags.append({"severity": "warning", "kind": "cell_changed_role",
-                          "file": m["file"],
-                          "detail": f"{m['from_role']} -> {m['to_role']} in {m['to_file']}: "
-                                    f"{m['text']!r}"})
-
     critical = [f for f in flags if f["severity"] == "critical"]
-    if section_mode:
-        score = integrity_score(cons["missing_cells"], cons["moved_cells"])
-    else:
-        score = 0.0 if critical else max(
-            0.0, 100.0 - REJECTION_PENALTY * rej_rate - REPROJECTION_PENALTY * rep_rate)
+    score = 0.0 if critical else max(
+        0.0, 100.0 - REJECTION_PENALTY * rej_rate - REPROJECTION_PENALTY * rep_rate)
 
     return {
-        "mode": report.get("mode") or "batched",
         "passed": not critical,
         "skipped": False,
         "score": round(score, 1),

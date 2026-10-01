@@ -176,19 +176,9 @@ CREDIT_FAILED = FLAGGED_WEIGHT
 # and an empty answer. Not a per-table credit loss like CREDIT_FAILED: nothing is
 # missing and the table may hold dozens of other, perfectly-stitched rows, so
 # scoring one page-break glitch like a whole failed table would drown it out.
-#
-# Scored in POINTS, severity-weighted, and not as a share of table credit: it used to
-# be 0.15 table-credit, which divided by the table count and so cost ~5 points in a
-# 3-table document and ~0.4 in a 35-table one for the same broken row — the size
-# dilution CELL_DEFECT_PENALTY exists to avoid. Now the cost is proportional to how
-# many rows are split and how certain each one is:
-#
-#   points = min(ROW_SPLIT_CAP, ROW_SPLIT_POINTS * sum(severity))
-#
-# with severity 1.0 for a confirmed split (kept_as_separate_row) — the same unit as
-# one confirmed cell defect — and less for an unconfirmed one (below).
-ROW_SPLIT_POINTS = 1.0
-ROW_SPLIT_CAP = 10.0
+# A small fixed deduction per occurrence instead, similar order of magnitude to
+# the gap between CREDIT_CONFIDENT and CREDIT_UNCERTAIN.
+ROW_SPLIT_PENALTY = 0.15
 
 # A row hybrid_extract's stitcher couldn't even check for a continuation, because the
 # new page's leading cell already holds real text (usually the next sub-question's own
@@ -197,24 +187,9 @@ ROW_SPLIT_CAP = 10.0
 # mid-sentence" evidence, but this shape hasn't been checked against the corpus the way
 # the blank-cell one has, and a length + not-a-heading filter still leaves real
 # false-positive risk (a genuinely new sub-section that happens to follow an answer
-# ending mid-list). At most half a confirmed split, scaled further by the stitcher's
-# own continuation confidence (0-100), floored so a detected one is never free:
-#
-#   severity = ROW_SPLIT_UNCONFIRMED_WEIGHT * clamp(confidence / 100, 0.2, 1.0)
-ROW_SPLIT_UNCONFIRMED_WEIGHT = 0.5
-
-# Every structural term Fidelity charges in points — source-cited shape defects plus
-# row splits — shares this ceiling, so one badly stitched document cannot lose more
-# than this from structure alone however many heuristics fire on it.
-FIDELITY_STRUCTURE_CAP = 15.0
-
-# A table-level "rows have inconsistent widths" finding is the SYMPTOM a page-break row
-# split leaves behind (the orphaned continuation row is wider or narrower than its
-# table). Measured on this corpus: all 27 unresolved row splits sat inside a table
-# check_source_fidelity also flagged inconsistent_table_columns. Charging both billed
-# one physical defect twice, so the specific row-level finding is charged and the
-# generic table-level one it explains is not (it stays listed, marked absorbed).
-_ROW_SPLIT_SYMPTOM_KINDS = frozenset({"inconsistent_table_columns"})
+# ending mid-list). Half the confirmed penalty: worth moving the score, not worth
+# treating as equally certain.
+ROW_SPLIT_PENALTY_UNCONFIRMED = 0.08
 
 # Explains every dimension in the UI: what it measures, where the number comes
 # from, what to do when it's low, and where it is still weak. Kept beside the
@@ -393,106 +368,221 @@ def _cell_defect_penalty(count: int) -> float:
     return min(count, CELL_DEFECT_CAP) * CELL_DEFECT_PENALTY
 
 
-_ROW_SPLIT_ACTIONS = ("kept_as_separate_row", "unflagged_continuation")
+# The actions below are Stage 2's own record of a page-break row it did NOT rejoin. That
+# record is frozen when Stage 2 runs, and it is wrong in two ways the tree being scored can
+# disprove, so each one is looked up in that tree (and in the PDF) before it is charged:
+#   * REJOINED_ACTION -- a later stage put the row back together (Netherlands__156999
+#     table_003 p36: after Stage 4 the page-36 tail reads on inside the 4.6 answer cell);
+#   * OWN_ROW_ACTION -- it was never a continuation. The row opening page N is a complete
+#     item of its own in the PDF ("(viii) Are there restrictions ..." and its whole answer,
+#     Mexico__183466 table_004 p19), and the stitcher read the table's empty left LABEL
+#     column as a continuation's blank first cell.
+#   * HEADER_ROW_ACTION -- the row is the table's column header, which the PDF prints again
+#     at the top of every page (Liechtenstein__180334 table_008 p61/p62, "Yes/No | If the
+#     answer is 'Yes' ..."), not a row cut in two.
+# A split is charged only while the tree still holds an orphan row for it -- one with no
+# question ahead of the continuation -- or when nothing about it can be established.
+UNRESOLVED_SPLIT_ACTIONS = ("kept_as_separate_row", "unflagged_continuation")
+REJOINED_ACTION = "rejoined_in_scored_tree"
+OWN_ROW_ACTION = "own_row_in_source"
+HEADER_ROW_ACTION = "repeated_header_in_source"
+# At least this many tokens ahead of the continuation in a row = that row carries its own
+# question, so it is not the orphan (empty question, empty answer) a split leaves behind.
+_OWN_QUESTION_MIN_TOKENS = 4
+_SPLIT_NEEDLE_TOKENS = 8
+# A sub-item label opening a question: "(viii)", "(b)", "(12)", "7.1", "a)".
+_ITEM_LABEL = re.compile(r"^\s*(\((?:[ivxlcdm]+|[a-z]{1,2}|\d+)\)|\d+(?:\.\d+)+\b|[a-z]\))", re.I)
 
 
-def _stitch_page(a: dict) -> int | None:
-    """The page a stitch anomaly's row sits on: `pages` is the whole table's range and
-    `block` the row's offset into it (the stitcher checks the first row of every page
-    after the table's first)."""
+def _tree_rows(tree: Path, read_chunks) -> list[tuple[list[str], tuple | None]]:
+    """Every table row of a stage tree as (one token list, its chunk's page range)."""
+    _, cells = read_chunks(tree)
+    grouped: dict[tuple, dict[int, list[str]]] = {}
+    ranges: dict[tuple, tuple | None] = {}
+    for c in cells:
+        key = (c["file"], c["table"], c["row"])
+        grouped.setdefault(key, {})[c["col"]] = c["tokens"]
+        ranges[key] = tuple(c["pages"]) if c.get("pages") else None
+    return [([t for k in sorted(cols) for t in cols[k]], ranges[key])
+            for key, cols in grouped.items()]
+
+
+def _grams(ts: list[str], w: int = _SPLIT_NEEDLE_TOKENS) -> set[tuple]:
+    return {tuple(ts[i:i + w]) for i in range(len(ts) - w + 1)}
+
+
+def _find(seq: list[str], needle: list[str]) -> int:
+    w = len(needle)
+    return next((i for i in range(len(seq) - w + 1) if seq[i:i + w] == needle), -1)
+
+
+def _pdf_first_row(page, keep_empty: bool = False) -> list[str]:
+    """The row Stage 2 reported, read from the PDF when its record carries no text: the
+    stitcher only ever checks the FIRST row of a page after a table's first, so this is
+    the top ruled row of page N."""
+    tables = sorted(page.find_tables(strategy="lines_strict").tables, key=lambda t: t.bbox[1])
+    for t in tables:
+        rows = t.extract()
+        if rows:
+            return [c or "" for c in rows[0]] if keep_empty \
+                else [c for c in rows[0] if c and c.strip()]
+    return []
+
+
+def _candidates(rows, needle: list[str], page: int):
+    """Tree rows holding `needle`, narrowed to chunks covering `page` when that helps."""
+    hits = [(r, pr, _find(r, needle)) for r, pr in rows]
+    hits = [(r, pr, i) for r, pr, i in hits if i >= 0]
+    near = [h for h in hits if h[1] and h[1][0] <= page <= h[1][1]]
+    return near or hits
+
+
+def _locate(rows, text: list[str], page: int):
+    """(row, offset, needle) of the ONE tree row holding this continuation, else None.
+
+    Longest needle first: answers in these questionnaires often open identically ("Any
+    language can be used where relying on ...", Mexico__183466 table_005 p27, three rows)
+    and only differ further on. A repeated passage is then narrowed to the chunk whose
+    page range covers the continuation's page. Still more than one row: ambiguous."""
+    for w in (40, 24, 16, _SPLIT_NEEDLE_TOKENS):
+        needle = text[:w]
+        if len(needle) < 4 or (w != _SPLIT_NEEDLE_TOKENS and len(needle) < w):
+            continue
+        hits = _candidates(rows, needle, page)
+        if len(hits) == 1:
+            return hits[0][0], hits[0][2], needle
+        if len(hits) > 1:
+            return None          # a shorter needle can only be more ambiguous
+    return None
+
+
+def _split_verdict(a: dict, rows: list[list[str]], doc, page_tokens: list[list[str]],
+                   tokens) -> str | None:
+    """REJOINED_ACTION / OWN_ROW_ACTION when the tree being scored demonstrably holds
+    this continuation in ONE row with its question, else None (still a split).
+
+    The row reported is the first of page N. If it is a genuine continuation, what it
+    belongs to is on page N-1, so it is repaired exactly when the row that now holds it
+    also holds, AHEAD of it, text the source prints on page N-1 and not on page N. If the
+    PDF's row on page N already opens with its own labelled question, it was never a
+    continuation, and the tree is right to hold it as one row with that question. Judged
+    against the PDF rather than an earlier stage's tree, because that tree may itself be
+    repaired or restructured. Unlocatable or ambiguous stays a split: this may only remove
+    a charge the tree itself disproves, never guess one away."""
     pages, block = a.get("pages") or [], a.get("block")
-    return pages[block] if isinstance(block, int) and 0 <= block < len(pages) else None
+    if not isinstance(block, int) or not 0 <= block < len(pages):
+        return None
+    page = pages[block]
+    if not 1 <= page <= len(page_tokens):
+        return None
+    first = _pdf_first_row(doc[page - 1], keep_empty=True)
+    first_toks = [tokens(c) for c in first]
+    # The column header, printed again at the top of the neighbouring page: not a split.
+    if any(first_toks):
+        for q in (page - 1, page + 1):
+            if 1 <= q <= len(doc) and q != page and \
+                    [tokens(c) for c in _pdf_first_row(doc[q - 1], keep_empty=True)] == first_toks:
+                return HEADER_ROW_ACTION
+    # A complete labelled item in the PDF -- "(viii) Are there restrictions ..." and its
+    # answer both printed on page N -- was never a continuation (the stitcher read the
+    # table's empty label column as a continuation's blank first cell). Not a split as
+    # long as the tree holds that question together with its answer.
+    if _whole_labelled_row_in_tree(first, rows, page, tokens):
+        return OWN_ROW_ACTION
+    # Stage 2's own text for the row, else (or when that is too short to find, e.g. just
+    # "IMAS: Yes.", Panama__183139 table_008 p46) the PDF's own top row: the longest cell.
+    texts = [t for t in (a.get("row_text") or a.get("surplus_text") or []) if t]
+    texts += [c for c in first if c.strip()]
+    if not texts:
+        return None
+    text = max((tokens(t) for t in texts), key=len)
+    found = _locate(rows, text, page)
+    if found:
+        row, at, needle = found
+        ahead = _grams(row[:at])
+        if ahead and page >= 2 and ahead & (_grams(page_tokens[page - 2])
+                                            - _grams(page_tokens[page - 1])):
+            return REJOINED_ACTION
+        return None
+    # Not unique. The continuation's text recurs in several rows (questionnaire answers
+    # repeat: "Please see (d) above"), so which row is its home cannot be told -- but the
+    # defect itself can: a split leaves an ORPHAN row, with nothing ahead of the
+    # continuation. If every row holding it carries its own question, no orphan exists.
+    needle = text[:_SPLIT_NEEDLE_TOKENS]
+    cands = _candidates(rows, needle, page) if len(needle) >= 4 else []
+    # Only page N-1 -- where a continuation's question actually is. Any earlier page is
+    # not evidence: these memoranda repeat whole questions section by section, so a
+    # stranded question tail (British Virgin Islands__175133 table_007 p41, "For example,
+    # can the sub-advisor ...") also occurs pages earlier, in another section.
+    earlier = _grams(page_tokens[page - 2]) if page >= 2 else set()
+    if len(cands) > 1 and all(_carries_own_question(r[:i], earlier) for r, _, i in cands):
+        return REJOINED_ACTION
+    return None
 
 
-def _stitch_key(a: dict) -> str:
-    """The dismissal key of the finding _collect_findings builds for this anomaly —
-    one definition, so a dismissal made in the UI is the one the scorer honours."""
-    prefix = ("row-split-unflagged" if a.get("action") == "unflagged_continuation"
-              else "row-split" if a.get("action") == "kept_as_separate_row" else "row-merge")
-    return dis.hierarchy_key(f"{prefix}-{a.get('table_id')}-{_stitch_page(a)}-{a.get('block')}")
+# A sub-item label as a TOKEN (tokenising drops the brackets): "a", "ii", "viii", "8".
+_LABEL_TOKEN = re.compile(r"^(?:[a-z]|[ivx]{1,5}|\d{1,2})$")
 
 
-def _row_split_severity(a: dict) -> float:
-    if a.get("action") == "kept_as_separate_row":
-        return 1.0
-    if a.get("action") == "unflagged_continuation":
-        conf = a.get("confidence")
-        frac = 0.5 if not isinstance(conf, (int, float)) else max(0.2, min(1.0, conf / 100.0))
-        return ROW_SPLIT_UNCONFIRMED_WEIGHT * frac
-    return 0.0
+def _carries_own_question(ahead: list[str], earlier: set) -> bool:
+    """Whether the text ahead of a continuation in its row is a question of that row's
+    own, not the orphan a split leaves. A split can also strand a question's TAIL ahead
+    of the answer's tail (Jersey__181919 p53, "Meeting, telephone call, email) without
+    itself being ..."), so length alone proves nothing: the text must either have been
+    printed on the previous page (the question the continuation rejoined) or open with an
+    item label (a row of its own). A question's tail does neither."""
+    if len(ahead) < _OWN_QUESTION_MIN_TOKENS:
+        return False
+    return bool(_grams(ahead) & earlier) or bool(_LABEL_TOKEN.match(ahead[0]))
 
 
-def _dedupe_row_splits(anomalies: list[dict] | None) -> list[dict]:
-    """One entry per PHYSICAL row (table, page, block): two heuristics — or a report
-    that logged the same row twice — describing one broken row are one defect. The
-    most severe reading of that row is the one kept."""
-    best: dict[tuple, dict] = {}
-    for a in anomalies or []:
-        if a.get("action") not in _ROW_SPLIT_ACTIONS:
+def _whole_labelled_row_in_tree(first: list[str], rows, page: int, tokens) -> bool:
+    """The PDF's top row of page N opens with its own labelled question (>= 6 tokens) and
+    carries an answer after it, and some tree row holds that question followed by the
+    opening of that answer."""
+    cells = [c for c in first if c.strip()]
+    for qi, c in enumerate(cells[:-1]):
+        q = tokens(c)
+        if len(q) < 6 or not _ITEM_LABEL.match(c):
             continue
-        loc = (a.get("table_id"), _stitch_page(a), a.get("block"))
-        if loc not in best or _row_split_severity(a) > _row_split_severity(best[loc]):
-            best[loc] = a
-    return list(best.values())
+        answer = next((tokens(x) for x in cells[qi + 1:] if tokens(x)), [])
+        if not answer:
+            return False
+        # Only the answer's opening: a later stage may tidy the rest (Botswana__183055
+        # table_018 p52, "See 8.10(a). See 8.10(a)." kept once), and the question ahead of
+        # it already pins the row.
+        a_needle = answer[:4]
+        for r, _, i in _candidates(rows, q[:_SPLIT_NEEDLE_TOKENS], page):
+            if _find(r[i:], a_needle) >= 0:
+                return True
+        return False
+    return False
 
 
-def _row_split_penalty(anomalies: list[dict] | None) -> float:
-    """Severity-weighted, capped points for unresolved row splits (see ROW_SPLIT_POINTS)."""
-    return min(ROW_SPLIT_CAP,
-               ROW_SPLIT_POINTS * sum(_row_split_severity(a)
-                                      for a in _dedupe_row_splits(anomalies)))
-
-
-def _dedupe_by_key(findings: list[dict]) -> list[dict]:
-    """A finding reported twice under the same content-derived key is one defect."""
-    seen, out = set(), []
-    for f in findings:
-        k = f.get("key")
-        if k is not None and k in seen:
-            continue
-        seen.add(k)
-        out.append(f)
+def _recheck_row_splits(anomalies: list[dict], out_root: Path, stage: int) -> list[dict]:
+    """Stage-2 stitch anomalies with each unresolved split re-checked against the stage
+    tree being scored and the PDF; one that tree disproves is re-labelled (REJOINED_ACTION
+    / OWN_ROW_ACTION), so it is reported as advisory and no longer costs Fidelity."""
+    if not any(a.get("action") in UNRESOLVED_SPLIT_ACTIONS for a in anomalies):
+        return anomalies
+    try:
+        tree = resolve_stage_dir(out_root, stage)
+        pdf = resolve_pdf(out_root, None)
+    except (StageDirectoryNotFoundError, FileNotFoundError):
+        return anomalies
+    if not Path(pdf).is_file():
+        return anomalies
+    import fitz  # lazy: only documents with an unresolved split pay for this
+    from check_source_fidelity import read_chunks, tokens
+    rows = _tree_rows(tree, read_chunks)
+    out = []
+    with fitz.open(str(pdf)) as doc:
+        page_tokens = [tokens(p.get_text()) for p in doc]
+        for a in anomalies:
+            verdict = (_split_verdict(a, rows, doc, page_tokens, tokens)
+                       if a.get("action") in UNRESOLVED_SPLIT_ACTIONS else None)
+            out.append({**a, "action": verdict, "stage2_action": a["action"]} if verdict else a)
     return out
-
-
-def _table_files(tree_dir: Path | None) -> dict[str, str]:
-    """table_id -> the tree file that holds it, from the MinerU badge line
-    ("**⚙ MinerU-extracted table** — table_011, pages 88–90, ..."). Lets a stitch
-    anomaly (which knows only its table) be matched to a source-fidelity finding (which
-    knows only its file)."""
-    out: dict[str, str] = {}
-    if not tree_dir or not Path(tree_dir).is_dir():
-        return out
-    for p in sorted(Path(tree_dir).rglob("*.md")):
-        try:
-            text = p.read_text(encoding="utf-8", errors="ignore")
-        except OSError:
-            continue
-        for m in re.finditer(r"\b(table_\d+),\s*pages?\b", text):
-            out.setdefault(m.group(1), str(p.relative_to(tree_dir)).replace("\\", "/"))
-    return out
-
-
-def _absorbed_by_row_splits(shape_defects: list[dict], splits: list[dict],
-                            table_files: dict[str, str]) -> list[dict]:
-    """The table-level symptom findings (see _ROW_SPLIT_SYMPTOM_KINDS) that a charged
-    row split in the SAME table already accounts for. Matched on file + page range; a
-    split whose table cannot be mapped to a file matches only when exactly one symptom
-    finding's page range holds its page, so an ambiguous match never absorbs anything."""
-    symptoms = [f for f in shape_defects if f.get("kind") in _ROW_SPLIT_SYMPTOM_KINDS
-                and f.get("pages")]
-    absorbed: dict[int, dict] = {}
-    for a in splits:
-        page = _stitch_page(a)
-        if page is None:
-            continue
-        in_range = [f for f in symptoms if min(f["pages"]) <= page <= max(f["pages"])]
-        file = table_files.get(a.get("table_id"))
-        hits = ([f for f in in_range if f.get("file") == file] if file
-                else in_range if len(in_range) == 1 else [])
-        for f in hits:
-            absorbed[id(f)] = f
-    return list(absorbed.values())
 
 
 def _load(path: Path):
@@ -1246,7 +1336,7 @@ def _score_fidelity(tables: list[dict], tpres: dict | None = None,
     # SCORED post-AI. What still counts either way: a table actually missing from the
     # CURRENT tree (checked against whichever stage `validate()` ran on — never stale),
     # and a row split across a page break (a Stage 2/3 stitching defect that Stage 4
-    # does not undo merely by existing — see ROW_SPLIT_POINTS).
+    # does not undo merely by existing — see ROW_SPLIT_PENALTY).
     earned = float(len(tables)) if stage else 0.0
     # NOT scored on cell-level grid damage, though it was briefly. check_table_cells
     # cannot currently locate a cell's own words on the page reliably enough to make
@@ -1281,24 +1371,24 @@ def _score_fidelity(tables: list[dict], tpres: dict | None = None,
         if t["table_id"] in lost_ids:
             earned -= 1.0 if stage else _table_credit(t)[0]
     # A row the stitcher could not safely rejoin after a page break (see
-    # ROW_SPLIT_POINTS): every character survives, but the row is split across two
-    # adjacent <tr>s in the shipped tree. Only the unresolved ones count —
-    # "realigned_and_merged" / "widened_and_merged" means Stage 2 already put the row
-    # back together, so there is nothing left here to penalise. The caller has already
-    # removed dismissed ones; deduplicated here per physical row.
-    splits = _dedupe_row_splits(stitch_anomalies)
-    row_splits = [a for a in splits if a.get("action") == "kept_as_separate_row"]
-    unconfirmed_splits = [a for a in splits if a.get("action") == "unflagged_continuation"]
-    split_points = _row_split_penalty(splits)
-    structure_points = min(FIDELITY_STRUCTURE_CAP,
-                           _cell_defect_penalty(len(defects)) + split_points)
-    return _clamp(100.0 * max(earned, 0.0) / len(tables) - structure_points), {
+    # ROW_SPLIT_PENALTY): every character survives, but the row is split across
+    # two adjacent <tr>s in the shipped tree. Only the unresolved ones count —
+    # "realigned_and_merged" / "widened_and_merged" means Stage 2 already put the
+    # row back together, so there is nothing left here to penalise.
+    row_splits = [a for a in (stitch_anomalies or [])
+                 if a.get("action") == "kept_as_separate_row"]
+    # The non-blank-leading-cell shape (see ROW_SPLIT_PENALTY_UNCONFIRMED): weaker
+    # evidence, so it costs less per occurrence rather than being ignored entirely.
+    unconfirmed_splits = [a for a in (stitch_anomalies or [])
+                          if a.get("action") == "unflagged_continuation"]
+    earned -= ROW_SPLIT_PENALTY * len(row_splits)
+    earned -= ROW_SPLIT_PENALTY_UNCONFIRMED * len(unconfirmed_splits)
+    return _clamp(100.0 * max(earned, 0.0) / len(tables)
+                  - _cell_defect_penalty(len(defects))), {
         "available": True, "tables_total": len(tables), "buckets": buckets,
         "tables_lost_after_extraction": len(lost),
         "rows_split_across_page_break": len(row_splits),
         "rows_possibly_split_unflagged": len(unconfirmed_splits),
-        "row_split_points": round(split_points, 2),
-        "structure_points": round(structure_points, 2),
         "stats": [
             {"label": "tables detected", "value": len(tables)},
             {"label": "clean geometric match", "value": buckets.get("confident", 0)},
@@ -1792,7 +1882,7 @@ def _collect_findings(cl: dict, ni: dict, tp: dict | None, tables: list[dict],
             out.append({
                 "key": dis.placement_key(f["table_id"], f.get("pages", [])),
                 "kind": "placement", "dimension": "placement", "severity": "silent",
-                "file": None, "pages": f.get("pages", []),
+                "file": f.get("file"), "pages": f.get("pages", []),
                 "title": f"{f['table_id']} may be under the wrong heading",
                 "detail": f.get("detail", ""),
             })
@@ -1972,19 +2062,21 @@ def _collect_findings(cl: dict, ni: dict, tp: dict | None, tables: list[dict],
         })
     # A row split across a page break that Stage 2's stitcher (hybrid_extract.
     # stitch_table_html) tried to rejoin. Every occurrence is logged whether or not
-    # the rejoin succeeded — see ROW_SPLIT_POINTS for why only the unresolved ones
+    # the rejoin succeeded — see ROW_SPLIT_PENALTY for why only the unresolved ones
     # cost anything. `pages[block]` recovers the actual page: `pages` is the whole
     # table's page range and `block` is this row's offset into it, since the
     # stitcher checks exactly the first row of every page after the table's first.
     for a in (stage2 or {}).get("stitch_anomalies", []) or []:
+        a_pages = a.get("pages") or []
         block = a.get("block")
-        page = _stitch_page(a)
+        page = (a_pages[block] if isinstance(block, int) and 0 <= block < len(a_pages)
+               else None)
         preview = " ".join(a.get("row_text") or a.get("surplus_text") or [])[:160]
         quoted = f" The row: “{preview}…”" if preview else ""
         table_id = a.get("table_id")
         if a.get("action") == "kept_as_separate_row":
             out.append({
-                "key": _stitch_key(a),
+                "key": dis.hierarchy_key(f"row-split-{table_id}-{page}-{block}"),
                 "kind": "row_split", "dimension": "fidelity", "severity": "silent",
                 "file": None, "pages": [page] if page else [],
                 "title": f"{table_id} page {page}: one source row was rendered as two",
@@ -2005,11 +2097,11 @@ def _collect_findings(cl: dict, ni: dict, tp: dict | None, tables: list[dict],
             # sub-question label), so the blank-cell check above never even looked at
             # it — this is caught only because the previous row's own last cell stops
             # mid-sentence. Weaker evidence than row_split above (see
-            # ROW_SPLIT_UNCONFIRMED_WEIGHT): a real split reads this way, but so can
+            # ROW_SPLIT_PENALTY_UNCONFIRMED): a real split reads this way, but so can
             # a genuinely new row that happens to follow an answer ending mid-list, so
             # this is reported at lower confidence and costs less.
             out.append({
-                "key": _stitch_key(a),
+                "key": dis.hierarchy_key(f"row-split-unflagged-{table_id}-{page}-{block}"),
                 "kind": "row_split_unflagged", "dimension": "fidelity",
                 "severity": "silent",
                 "file": None, "pages": [page] if page else [],
@@ -2024,22 +2116,44 @@ def _collect_findings(cl: dict, ni: dict, tp: dict | None, tables: list[dict],
                           f"period — confidence {a.get('confidence')}/100."
                           + quoted),
             })
+        elif a.get("action") == OWN_ROW_ACTION:
+            # Stage 2 reported a continuation that the PDF shows is a complete item of
+            # its own -- see _recheck_row_splits. Nothing to rejoin; advisory only.
+            out.append({
+                "key": dis.hierarchy_key(f"row-own-{table_id}-{page}-{block}"),
+                "kind": "row_continuation_merged", "dimension": "fidelity",
+                "severity": "advisory",
+                "file": None, "pages": [page] if page else [],
+                "title": f"{table_id} page {page}: not a split — the row is complete in "
+                         "the source",
+                "detail": ("Stage 2 read this row as the continuation of one from the "
+                          "previous page, but in the PDF it opens with its own labelled "
+                          "question and holds its whole answer, and the tree holds them "
+                          "together in one row. The blank leading cell it reacted to is the "
+                          "table's empty label column." + quoted),
+            })
         else:
             # realigned_and_merged / widened_and_merged: Stage 2 already put the row
-            # back together. Advisory only — same status as orphan_recovered above —
-            # because a continuation merge is exactly the kind of automatic repair
-            # worth a reviewer's eye even when it worked.
+            # back together. REJOINED_ACTION: Stage 2 left it split but the tree being
+            # scored holds it as one row -- see _recheck_row_splits. Advisory only —
+            # same status as orphan_recovered above — because a continuation merge is
+            # exactly the kind of automatic repair worth a reviewer's eye even when it
+            # worked.
+            rejoined_later = a.get("action") == REJOINED_ACTION
             out.append({
-                "key": _stitch_key(a),
+                "key": dis.hierarchy_key(f"row-merge-{table_id}-{page}-{block}"),
                 "kind": "row_continuation_merged", "dimension": "fidelity",
                 "severity": "advisory",
                 "file": None, "pages": [page] if page else [],
                 "title": f"{table_id} page {page}: continuation row rejoined "
-                        f"({a.get('action')})",
-                "detail": ("This row continued from the previous page and was "
-                          "automatically merged back into it — confirm the pairing "
-                          "reads correctly rather than fusing the wrong cells."
-                          + quoted),
+                        f"({'after Stage 3' if rejoined_later else a.get('action')})",
+                "detail": (("This row continues from the previous page. Stage 2 kept it "
+                           "as a separate row, but the tree scored here holds it back "
+                           "in one row, so it is no longer a split" if rejoined_later
+                           else "This row continued from the previous page and was "
+                                "automatically merged back into it")
+                          + " — confirm the pairing reads correctly rather than fusing "
+                            "the wrong cells." + quoted),
             })
     for x in (fn or {}).get("orphan_definitions", []):
         out.append({
@@ -2283,6 +2397,11 @@ def compute_scorecard(out_root: Path, validation: dict | None = None,
     if stage1 is None and import_meta.get("import_kind") == "exported_chunks":
         stage1 = {"pages": import_meta.get("pages"), "structure_source": "imported_export"}
     stage2 = next((_load(p) for p in sorted(out_root.glob("0*_*mineru*/stage2_report.json"))), None)
+    if (stage2 or {}).get("stitch_anomalies"):
+        # See UNRESOLVED_SPLIT_ACTIONS: a tree is scored on its OWN rows (and the PDF's),
+        # not on Stage 2's frozen verdict about them.
+        stage2 = {**stage2, "stitch_anomalies": _recheck_row_splits(
+            stage2["stitch_anomalies"], out_root, stage or 3)}
     stage3 = next((_load(p) for p in sorted(out_root.glob("0*_*final*/stage3_report.json"))), None)
     tables = (stage2 or {}).get("tables", []) or []
 
@@ -2368,7 +2487,8 @@ def compute_scorecard(out_root: Path, validation: dict | None = None,
     table_shape_defects = [f for f in source_fidelity.get("findings", [])
                           if f.get("kind") in ("inconsistent_table_columns", "cell_split",
                                                "row_merge", "column_merge", "block_merge",
-                                               "row_alignment", "table_as_text")
+                                               "row_alignment", "table_as_text",
+                                               "prose_as_table")
                           and not f["dismissed"]
                           and f.get("evidence", {}).get("confidence") != "advisory"]
     # A source table whose cells survive as bare text, never becoming an output
@@ -2379,32 +2499,6 @@ def compute_scorecard(out_root: Path, validation: dict | None = None,
     missing_answer_findings = [f for f in source_fidelity.get("findings", [])
                               if f.get("kind") == "missing_cell_answer" and not f["dismissed"]
                               and f.get("evidence", {}).get("confidence") != "advisory"]
-    # DETECTION vs SCORING. Everything above is detection: every finding stays in
-    # `findings`, dismissed or not, charged or not. What follows decides which of them
-    # cost points — only an active (not dismissed), non-duplicate instance does, and a
-    # table-level symptom already explained by a charged row split is not billed again.
-    boundary_leaks = _dedupe_by_key(boundary_leaks)
-    source_duplicates = _dedupe_by_key(source_duplicates)
-    missing_answer_findings = _dedupe_by_key(missing_answer_findings)
-    # Empty answer segments and row splits are built by _collect_findings above, so
-    # their dismissal state lives on those finding objects / their shared key.
-    empty_segment_count = len(_dedupe_by_key(
-        [f for f in findings if f["kind"] == "empty_answer_segment" and not f["dismissed"]]))
-    active_splits = _dedupe_row_splits(
-        [a for a in (stage2 or {}).get("stitch_anomalies", []) or []
-         if _stitch_key(a) not in dismissed_keys])
-    try:
-        _tree_dir = resolve_stage_dir(out_root, stage or 3)
-    except Exception:                                        # noqa: BLE001
-        _tree_dir = None
-    absorbed = _absorbed_by_row_splits(table_shape_defects, active_splits,
-                                       _table_files(_tree_dir))
-    for f in absorbed:
-        f["charged"] = False
-        f["absorbed_by"] = "row_split"
-    absorbed_ids = {id(f) for f in absorbed}
-    table_shape_defects = _dedupe_by_key([f for f in table_shape_defects
-                                          if id(f) not in absorbed_ids])
     cl_s, ni_s, tp_s, tables_s = _apply_dismissals(cl, ni, tp, tables, dismissed_keys)
     hier_s = _apply_census_dismissals(hier, dismissed_keys)
 
@@ -2429,14 +2523,14 @@ def compute_scorecard(out_root: Path, validation: dict | None = None,
         "completeness": _score_completeness(wc, cl_s, unread_silent, unread_flagged, n_pages,
                                            negation_flips, pcov, orphans=orphans,
                                            tcons=tcons,
-                                           empty_segment_count=empty_segment_count,
+                                           empty_segment_count=len(empty_segments),
                                            missing_answers=missing_answer_findings,
                                            source_cells_checked=source_cells_checked),
         "placement": _score_placement(tp_s, len(tables_s), hier,
                                       boundary_leaks=boundary_leaks,
                                       source_cells_checked=source_cells_checked),
         "fidelity": _score_fidelity(tables_s, tpres, tcells,
-                                    active_splits, stage,
+                                    (stage2 or {}).get("stitch_anomalies"), stage,
                                     shape_defects=table_shape_defects,
                                     source_cells_checked=source_cells_checked),
         "uniqueness": _score_uniqueness(wc, source_duplicates=source_duplicates,
@@ -2449,13 +2543,11 @@ def compute_scorecard(out_root: Path, validation: dict | None = None,
                                         _unchunked),
     }.items():
         dims[key] = {"score": score, "detail": detail, **HELP[key]}
-    if absorbed and isinstance(dims["fidelity"].get("detail"), dict):
-        dims["fidelity"]["detail"]["shape_findings_absorbed_by_row_split"] = len(absorbed)
     # `fidelity` used to be blanked out entirely on the post-AI re-score, because its
     # geometric bbox counts (see _score_fidelity's table-credit loop) are a re-skin of
     # Stage 2's IoU match, frozen before Stage 4 ever ran, and genuinely stale once the
     # tree has been rewritten. But the row-split terms in that same score
-    # (ROW_SPLIT_POINTS / ROW_SPLIT_UNCONFIRMED_WEIGHT) describe a Stage 2/3 STITCHING
+    # (ROW_SPLIT_PENALTY / ROW_SPLIT_PENALTY_UNCONFIRMED) describe a Stage 2/3 STITCHING
     # defect, not a Stage 4 one — whether a row was split across a page break has
     # nothing to do with what the AI pass did afterward, so blanking the whole
     # dimension hid a real, still-current defect behind a stale-bbox excuse that didn't

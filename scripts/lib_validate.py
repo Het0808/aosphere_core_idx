@@ -126,7 +126,9 @@ STAGE_SCOPED = frozenset({
 # document promises this section and the tree does not have it", and that question
 # is meaningless asked of a tree two stages out of date. Pinned to stage 3 it graded
 # the pre-AI document and reported the result as the post-AI verdict.
-TREE_STAGE_SCOPED = frozenset({"heading_hierarchy"})
+TREE_STAGE_SCOPED = frozenset({"heading_hierarchy", "table_placement"})
+# table_placement reads Stage 1's manifests (what page each table is on) AND, via the same
+# `tree_stage`, the output tree to see which FILE each table was written into.
 
 # Stage dirs that can hold a scoreable output tree, worst-to-best. 2 is absent on
 # purpose: 02_ is MinerU's per-table HTML/JSON, not a markdown tree.

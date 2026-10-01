@@ -626,6 +626,11 @@ def _build_page_issues(job: dict, view: str = "extraction") -> dict:
         kind = f.get("kind")
         if kind == "gap" and f.get("severity") == "flagged":
             kind = "gap_acknowledged"
+        # A table-shape finding carries the name of what happened to the table
+        # (MERGED_CELL / MERGED_ROW / SPLIT_CELL) beside the detector's own kind; this
+        # list only displays, so it shows the name a reader should see.
+        if f.get("tag"):
+            kind = f["tag"].lower()
         where = f.get("file")
         detail = f.get("detail") or ""
         # check_source_fidelity.py's cell-level findings (section_boundary_leak,
@@ -2278,6 +2283,27 @@ JOB_HTML = """<!doctype html>
   .find-btn.restore {{ color:#7fb0ff; border-color:#2f4a72; }}
   .find-none {{ color:#3ddc76; font-size:0.86rem; padding:12px 14px; background:#0f2417;
                 border:1px solid #1f5c33; border-radius:8px; }}
+  .find-critical {{ border-left-color:#ff6b6b; }}
+  .find-prio {{ font-size:0.63rem; font-weight:700; letter-spacing:0.05em; padding:2px 6px; border-radius:4px; }}
+  .find-prio-high {{ background:#3a1414; color:#ff6b6b; }}
+  .find-prio-medium {{ background:#3a2a10; color:#f0a83c; }}
+  .find-prio-low {{ background:#1b2436; color:#8fb0e0; }}
+  .find-short {{ display:-webkit-box; -webkit-line-clamp:3; -webkit-box-orient:vertical; overflow:hidden; }}
+  .find-acts {{ display:flex; flex-direction:column; gap:6px; flex:none; }}
+  /* Not .find-btn: the frozen gallery page hides .find-btn (read-only, no dismissals),
+     but navigating to an issue works there too. */
+  .find-view {{ flex:none; background:#1d2230; color:#7fb0ff; border:1px solid #2f4a72;
+                border-radius:6px; padding:5px 11px; font-size:0.77rem; cursor:pointer; white-space:nowrap; }}
+  .find-view:hover {{ background:#252b3a; color:#e6e6e6; }}
+  .find-filters {{ display:flex; gap:6px; flex-wrap:wrap; margin:0 0 12px; }}
+  .find-filter {{ background:#1d2230; color:#9aa0ac; border:1px solid #2f3542; border-radius:14px;
+                  padding:4px 11px; font-size:0.77rem; cursor:pointer; }}
+  .find-filter.active {{ background:#243352; color:#e6e6e6; border-color:#3d5a8a; }}
+  .find-filter .n {{ color:#7d8494; margin-left:4px; }}
+  details.find-group {{ margin-bottom:7px; }}
+  details.find-group summary {{ padding:9px 13px; }}
+  details.find-group summary .find-group-show {{ color:#7fb0ff; margin-left:8px; font-size:0.77rem; }}
+  details.find-group[open] summary .find-group-show {{ display:none; }}
   .flow {{ display:flex; align-items:stretch; gap:6px; margin-top:14px; flex-wrap:wrap; }}
   .flow-step {{ flex:1; min-width:140px; border-radius:6px; padding:10px 12px;
                 border:1px solid #262b36; background:#141721; }}
@@ -2584,15 +2610,40 @@ function sourceRangeOf(text) {{
   return (a >= 1 && b >= a) ? [a, b] : null;
 }}
 
+// The newest click wins. A page image arrives asynchronously, and a slower, older one must
+// never paint (or report a failure) over the page the reader has since moved to.
+let pdfRenderSeq = 0;
+
 function setDocPdfPage(p) {{
   const lo = 1, hi = pdfTotalPages || Infinity;
   p = Math.max(lo, Math.min(hi, p || 1));
   pdfCurrentPage = p;
+  const seq = ++pdfRenderSeq;
   const body = document.getElementById('doc-pdf-body');
-  body.innerHTML = `<div class="pdf-pno">page ${{p}}</div>` +
-    `<img src="/api/jobs/${{JOB_ID}}/page_image/${{p}}" alt="page ${{p}}" ` +
-    `onerror="this.replaceWith(Object.assign(document.createElement('div'),` +
-    `{{className:'pdf-empty',textContent:'page ${{p}} could not be rendered'}}))">`;
+  const label = document.createElement('div');
+  label.className = 'pdf-pno';
+  label.textContent = `page ${{p}}`;
+  const img = document.createElement('img');
+  img.alt = `page ${{p}}`;
+  const fail = () => {{
+    if (seq !== pdfRenderSeq) return;
+    const msg = document.createElement('div');
+    msg.className = 'pdf-empty';
+    msg.textContent = `page ${{p}} could not be rendered`;
+    img.replaceWith(msg);
+  }};
+  img.onerror = fail;
+  body.innerHTML = '';
+  body.append(label, img);
+  if (window.aciPageImage) {{
+    // A published (frozen) page has no server to ask: inspect_shim.js renders the page from
+    // the embedded PDF and hands the image back. Pointing the <img> at a server URL instead
+    // starts a request that can only fail, racing the render and sometimes destroying the
+    // element the render was about to fill.
+    window.aciPageImage(p).then(url => {{ if (seq === pdfRenderSeq) img.src = url; }}, fail);
+  }} else {{
+    img.src = `/api/jobs/${{JOB_ID}}/page_image/${{p}}`;
+  }}
   const pos = document.getElementById('doc-pdf-pos');
   pos.textContent = pdfTotalPages ? `page ${{p}} of ${{pdfTotalPages}}` : `page ${{p}}`;
   document.getElementById('doc-pdf-prev').disabled = p <= lo;
@@ -3096,6 +3147,8 @@ const PR_KIND_LABEL = {{
   empty_answer_segment: 'MISSING CONTENT', row_split: 'ROW SPLIT',
   row_split_unflagged: 'ROW SPLIT (UNCONFIRMED)', row_continuation_merged: 'ROW MERGED',
   row_merge: 'ROW MERGE', table_without_source_grid: 'TABLE NO SOURCE GRID',
+  merged_cell: 'MERGED_CELL', merged_row: 'MERGED_ROW', split_cell: 'SPLIT_CELL',
+  prose_as_table: 'PROSE AS TABLE',
   section_boundary_leak: 'SECTION BOUNDARY LEAK', extraction_annotation: 'EXTRACTION ANNOTATION',
   duplicated_content: 'DUPLICATED CONTENT', inconsistent_table_columns: 'INCONSISTENT COLUMNS',
 }};
@@ -3116,6 +3169,8 @@ const PR_KIND_CLASS = {{
   empty_answer_segment: 'val-issue-red', row_split: 'val-issue-red',
   row_split_unflagged: 'val-issue-amber', row_continuation_merged: 'val-issue-amber',
   row_merge: 'val-issue-red', table_without_source_grid: 'val-issue-red',
+  merged_cell: 'val-issue-red', merged_row: 'val-issue-red', split_cell: 'val-issue-red',
+  prose_as_table: 'val-issue-amber',
   section_boundary_leak: 'val-issue-red', extraction_annotation: 'val-issue-amber',
   duplicated_content: 'val-issue-amber', inconsistent_table_columns: 'val-issue-red',
 }};
@@ -3171,15 +3226,38 @@ function renderNav(node, container) {{
 // The issue column keeps tracking whichever page is displayed, so stepping onto a
 // clean page correctly says "no flagged issues" rather than going stale.
 let prPdfPage = null;
+// Newest request wins, exactly as setDocPdfPage's pdfRenderSeq: a page image arrives
+// asynchronously, and a slower or failed older one must never paint -- or report a
+// failure -- over the page the reviewer has since moved to.
+let prRenderSeq = 0;
 
 function setPRPdfPage(p) {{
   const hi = pdfTotalPages || Infinity;
   p = Math.max(1, Math.min(hi, p || 1));
   prPdfPage = p;
-  document.getElementById('pr-page-body').innerHTML =
-    `<img src="/api/jobs/${{JOB_ID}}/page_image/${{p}}" alt="page ${{p}}" ` +
-    `onerror="this.replaceWith(Object.assign(document.createElement('div'),` +
-    `{{className:'pdf-empty',textContent:'page ${{p}} could not be rendered'}}))">`;
+  const seq = ++prRenderSeq;
+  const body = document.getElementById('pr-page-body');
+  const img = document.createElement('img');
+  img.alt = `page ${{p}}`;
+  const fail = () => {{
+    if (seq !== prRenderSeq) return;
+    const msg = document.createElement('div');
+    msg.className = 'pdf-empty';
+    msg.textContent = `page ${{p}} could not be rendered`;
+    img.replaceWith(msg);
+  }};
+  img.onerror = fail;
+  body.innerHTML = '';
+  body.append(img);
+  if (window.aciPageImage) {{
+    // A published (frozen) page has no server: inspect_shim.js renders the page from the
+    // embedded PDF and hands the image back. An <img> pointed at a server URL starts a
+    // request that can only fail, racing the render and sometimes destroying the element
+    // the render was about to fill (see setDocPdfPage).
+    window.aciPageImage(p).then(url => {{ if (seq === prRenderSeq) img.src = url; }}, fail);
+  }} else {{
+    img.src = `/api/jobs/${{JOB_ID}}/page_image/${{p}}`;
+  }}
   const pos = document.getElementById('pr-pdf-pos');
   if (pos) pos.textContent = pdfTotalPages ? `${{p}} / ${{pdfTotalPages}}` : `page ${{p}}`;
   const prev = document.getElementById('pr-pdf-prev');
@@ -3248,6 +3326,9 @@ function loadPRPage(pno, file) {{
 
 async function loadPageReview() {{
   const nav = document.getElementById('pr-nav');
+  // Taken before anything is awaited: if the reviewer steps to another page while this is
+  // still fetching, the jump to the first issue page at the end must not drag them back.
+  const navAtStart = prRenderSeq;
   // Same scorecard the dimension panel is showing, so the two can never describe
   // different documents.
   const r = await fetch(`/api/jobs/${{JOB_ID}}/page_issues.json?view=${{SC_VIEW}}`);
@@ -3274,7 +3355,10 @@ async function loadPageReview() {{
   if (!issuePages.size) {{ nav.innerHTML = '<p style="color:#3ddc76; font-size:0.85rem;">&#10003; No findings on any page (stage ' + (data.scored_stage || 3) + ').</p>'; return; }}
   nav.innerHTML = '';
   renderNav(buildNestedNav(data.file_ranges || [], issuePages), nav);
-  loadPRPage(Math.min(...issuePages));
+  // Untouched since the load began: open on the first page with an issue, as always. If the
+  // reviewer has moved on, stay on their page -- re-read against the issue data that has
+  // just arrived, which the page they are on was rendered without.
+  loadPRPage(prRenderSeq === navAtStart ? Math.min(...issuePages) : prPdfPage);
 }}
 
 const GATE_TEXT = {{
@@ -3705,10 +3789,103 @@ const FIND_KIND_LABEL = {{
   orphan_duplicate: 'orphan table (duplicate — nothing lost)',
 }};
 
-function renderFinding(f) {{
+// ---- presentation only: which findings are surfaced first, and how the list filters ----
+// Read straight off each finding's existing severity / kind / dimension. Nothing here
+// changes what is detected, how anything is scored, or what counts as a finding.
+// Advisory findings stay in All Findings; everything else is "requiring attention".
+// Structural table defects a reviewer must see first, whatever severity the check gave them.
+const FIND_PRIORITY_HIGH = new Set(['section_boundary_leak', 'placement', 'cell_split',
+  'row_merge', 'column_merge', 'block_merge']);
+// Page-break row splits: a table continuing onto the next page, left as two rows with
+// nothing lost. Worth a look, never urgent -- LOW whatever severity the check gave them.
+const FIND_PRIORITY_LOW = new Set(['row_split', 'row_split_unflagged']);
+const FIND_PRIORITY_MEDIUM = new Set(['missing_cell_answer', 'table_as_text', 'prose_as_table', 'row_alignment',
+  'table', 'table_lost', 'orphan_table']);
+const FIND_PRIORITY_RANK = {{ high: 0, medium: 1, low: 2 }};
+const FIND_TABLE_KINDS = new Set(['inconsistent_table_columns', 'cell_split', 'row_merge', 'column_merge',
+  'block_merge', 'row_alignment', 'table_as_text', 'prose_as_table', 'table_without_source_grid', 'boxed_layout_as_text',
+  'row_split', 'row_continuation_merged', 'missing_cell_answer', 'table', 'table_lost', 'orphan_table',
+  'orphan_recovered', 'orphan_duplicate']);
+const FIND_PLACEMENT_KINDS = new Set(['section_boundary_leak', 'placement', 'hierarchy', 'found_elsewhere',
+  'outline_absent', 'section_missing', 'appendix_swallowed', 'duplicated_content', 'duplicate_chunk']);
+const FIND_COMPLETENESS_KINDS = new Set(['gap', 'text_absent', 'missing_cell_answer', 'empty_answer_segment',
+  'orphan_table', 'table_lost', 'unreadable']);
+const FIND_FILTERS = [['all', 'All'], ['important', 'Important'], ['tables', 'Tables'],
+  ['placement', 'Placement'], ['completeness', 'Completeness'], ['advisory', 'Advisory']];
+let FIND_FILTER = 'all';   // survives the re-render a Dismiss/Restore triggers
+
+function findPriority(f) {{
+  const sev = f.severity || 'advisory';
+  if (sev === 'advisory') return null;
+  if (FIND_PRIORITY_LOW.has(f.kind)) return 'low';
+  if (sev === 'critical' || sev === 'silent' || FIND_PRIORITY_HIGH.has(f.kind)) return 'high';
+  return FIND_PRIORITY_MEDIUM.has(f.kind) || sev === 'flagged' ? 'medium' : 'low';
+}}
+
+function findCats(f) {{
+  const c = [findPriority(f) ? 'important' : 'advisory'];
+  if (FIND_TABLE_KINDS.has(f.kind) || f.dimension === 'fidelity') c.push('tables');
+  if (FIND_PLACEMENT_KINDS.has(f.kind) || ['placement', 'sectioning', 'structure'].includes(f.dimension)) c.push('placement');
+  if (FIND_COMPLETENESS_KINDS.has(f.kind) || f.dimension === 'completeness') c.push('completeness');
+  return c;
+}}
+
+function sortByPriority(list) {{
+  return list.slice().sort((a, b) =>
+    (FIND_PRIORITY_RANK[findPriority(a)] ?? 3) - (FIND_PRIORITY_RANK[findPriority(b)] ?? 3)
+    || ((a.pages || [])[0] || 0) - ((b.pages || [])[0] || 0));
+}}
+
+// All Findings: important ones one by one (priority order), then advisory ones grouped by
+// kind when a kind repeats -- "NUMBER · 18 issues", expanded on demand. Every finding is
+// still rendered, with its own Dismiss button; grouping only folds them.
+function renderAllFindings(active) {{
+  const imp = sortByPriority(active.filter(f => findPriority(f)));
+  const adv = active.filter(f => !findPriority(f));
+  let h = imp.map(f => renderFinding(f)).join('');
+  const byKind = new Map();
+  for (const f of adv) {{
+    if (!byKind.has(f.kind)) byKind.set(f.kind, []);
+    byKind.get(f.kind).push(f);
+  }}
+  for (const [kind, list] of byKind) {{
+    if (list.length < 2) {{ h += renderFinding(list[0]); continue; }}
+    const cats = [...new Set(list.flatMap(findCats))].join(' ');
+    h += `<details class="val-advanced find-group" data-cats="${{cats}}"><summary>
+        <span class="find-kind">${{escapeHtml(FIND_KIND_LABEL[kind] || kind)}}</span>
+        &middot; ${{list.length}} issues <span class="find-kind" style="background:#26262e;color:#8b8f9a">advisory</span>
+        <span class="find-group-show">Show all</span></summary>
+      <div class="val-advanced-body">${{list.map(f => renderFinding(f)).join('')}}</div></details>`;
+  }}
+  return h;
+}}
+
+function renderFindFilters(active) {{
+  const n = k => k === 'all' ? active.length : active.filter(f => findCats(f).includes(k)).length;
+  return '<div class="find-filters">' + FIND_FILTERS.map(([k, label]) =>
+    `<button class="find-filter${{k === FIND_FILTER ? ' active' : ''}}" data-ffilter="${{k}}">${{label}}<span class="n">${{n(k)}}</span></button>`
+  ).join('') + '</div>';
+}}
+
+function applyFindFilter(root) {{
+  root.querySelectorAll('[data-ffilter]').forEach(b => b.classList.toggle('active', b.dataset.ffilter === FIND_FILTER));
+  root.querySelectorAll('#all-findings-list [data-cats]').forEach(el => {{
+    el.style.display = (FIND_FILTER === 'all' || el.dataset.cats.split(' ').includes(FIND_FILTER)) ? '' : 'none';
+  }});
+}}
+
+// "View issue": the page it cites in Page Review (PDF beside everything flagged there),
+// or, for a finding with no page, its chunk in the Document tab.
+function viewFinding(file, page) {{
+  if (page) gotoPage(Number(page));
+  else if (file) jumpToFile(file);
+}}
+
+function renderFinding(f, opts) {{
+  opts = opts || {{}};
   const sevCls = f.dismissed ? 'find-advisory' : ('find-' + (f.severity || 'advisory'));
   const where = [f.file ? f.file.split('/').pop() : null,
-                 (f.pages && f.pages.length) ? 'p' + f.pages.join('–') : null]
+                 (f.pages && f.pages.length) ? 'p' + (f.pages.length > 2 ? f.pages[0] + '–' + f.pages[f.pages.length - 1] : f.pages.join('–')) : null]
                 .filter(Boolean).join(' \\u00b7 ');
   const dismissedNote = f.dismissed && f.dismissal
     ? `<div class="find-detail">Dismissed as a false positive${{f.dismissal.reason ? ': ' + escapeHtml(f.dismissal.reason) : ''}} \\u2014 excluded from the score, kept on record.</div>`
@@ -3721,26 +3898,38 @@ function renderFinding(f) {{
     ? `<button class="find-btn restore" data-act="restore" data-key="${{escapeHtml(f.key)}}">Restore</button>`
     : `<button class="find-btn" data-act="dismiss" data-key="${{escapeHtml(f.key)}}"`
       + ` data-title="${{escapeHtml(f.title)}}">Dismiss</button>`;
-  return `<div class="find ${{sevCls}}${{f.dismissed ? ' is-dismissed' : ''}}">
+  const prio = !f.dismissed && findPriority(f);
+  const page = (f.pages && f.pages.length) ? f.pages[0] : '';
+  const view = (!f.dismissed && (page || f.file))
+    ? `<button class="find-view" data-act="view" data-file="${{escapeHtml(f.file || '')}}" data-page="${{page}}">View issue</button>`
+    : '';
+  return `<div class="find ${{sevCls}}${{f.dismissed ? ' is-dismissed' : ''}}" data-cats="${{findCats(f).join(' ')}}">
     <div class="find-main">
       <div class="find-top">
-        <span class="find-kind">${{FIND_KIND_LABEL[f.kind] || f.kind}}</span>
+        ${{prio ? `<span class="find-prio find-prio-${{prio}}">${{prio.toUpperCase()}}</span>` : ''}}
+        <span class="find-kind">${{f.tag || FIND_KIND_LABEL[f.kind] || f.kind}}</span>
         ${{f.severity === 'silent' ? '<span class="find-kind" style="background:#3a1414;color:#ff6b6b">silent</span>' : ''}}
         ${{f.severity === 'advisory' ? '<span class="find-kind" style="background:#26262e;color:#8b8f9a">advisory</span>' : ''}}
         <span class="find-where">${{escapeHtml(where)}}</span>
       </div>
       <div class="find-title">${{escapeHtml(f.title)}}</div>
-      <div class="find-detail">${{escapeHtml(f.detail || '')}}</div>
+      <div class="find-detail${{opts.short ? ' find-short' : ''}}" title="${{opts.short ? escapeHtml(f.detail || '') : ''}}">${{escapeHtml(f.detail || '')}}</div>
       ${{dismissedNote}}
-    </div>${{btn}}</div>`;
+    </div><div class="find-acts">${{view}}${{btn}}</div></div>`;
 }}
 
 function wireFindingButtons(container) {{
   container.querySelectorAll('button[data-act]').forEach(b => {{
     b.onclick = () => (b.dataset.act === 'dismiss'
       ? dismissFinding(b.dataset.key, b.dataset.title || '')
-      : restoreFinding(b.dataset.key));
+      : b.dataset.act === 'view'
+        ? viewFinding(b.dataset.file, b.dataset.page)
+        : restoreFinding(b.dataset.key));
   }});
+  container.querySelectorAll('[data-ffilter]').forEach(b => {{
+    b.onclick = () => {{ FIND_FILTER = b.dataset.ffilter; applyFindFilter(container); }};
+  }});
+  applyFindFilter(container);
 }}
 
 async function dismissFinding(key, title) {{
@@ -4052,6 +4241,25 @@ async function loadScorecard() {{
   html += '<div class="dim-grid">';
   for (const [key, d] of ordered) html += renderDimension(key, d, th);
   html += '</div>';
+
+  const findings = sc.findings || [];
+  const active = findings.filter(f => !f.dismissed);
+  const gone = findings.filter(f => f.dismissed);
+
+  // ---- issues requiring attention: every non-advisory open finding, HIGH -> MEDIUM -> LOW ----
+  // Directly under the score cards so a real structural/content issue is never buried under
+  // advisory noise. The same findings are also listed in All Findings below; this panel only
+  // orders and surfaces them.
+  const important = sortByPriority(active.filter(f => findPriority(f)));
+  const prioCount = p => important.filter(f => findPriority(f) === p).length;
+  html += `<div class="panel"><h4>Issues Requiring Attention &mdash; ${{important.length}}</h4>
+    <div class="panel-sub">Open findings that are not advisory, most serious first:
+      <b>${{prioCount('high')}}</b> high &middot; <b>${{prioCount('medium')}}</b> medium &middot;
+      <b>${{prioCount('low')}}</b> low. <b>View issue</b> opens the cited page in Page Review.</div>`;
+  html += important.length
+    ? important.map(f => renderFinding(f, {{ short: true }})).join('')
+    : `<div class="find-none">&#10003; Nothing requires attention${{active.length ? ` &mdash; ${{active.length}} advisory finding(s) below` : ''}}.</div>`;
+  html += '</div>';
   html += diffHtml;
 
   // ---- individual findings, dismissable ----
@@ -4059,10 +4267,7 @@ async function loadScorecard() {{
   // regressed between stage 3 and whatever stage 4/5 left behind, and a finding is the same
   // kind of claim at a finer grain (one specific gap, one specific table) -- the two belong
   // read together, not separated by the TOC/Review panels in between.
-  const findings = sc.findings || [];
-  const active = findings.filter(f => !f.dismissed);
-  const gone = findings.filter(f => f.dismissed);
-  html += `<div class="panel"><h4>Findings &mdash; ${{active.length}} open</h4>
+  html += `<div class="panel"><h4>All Findings &mdash; ${{active.length}} open</h4>
     <div class="panel-sub">Each one is an individual claim you can judge. <b>Dismiss</b> marks it a
       false positive: it leaves the score and the page heat-map, but it is kept on record and can be
       restored at any time &mdash; nothing is deleted. Dismissals are stored against the source PDF,
@@ -4070,7 +4275,7 @@ async function loadScorecard() {{
   if (!active.length) {{
     html += '<div class="find-none">&#10003; No open findings.</div>';
   }} else {{
-    for (const f of active) html += renderFinding(f);
+    html += renderFindFilters(active) + `<div id="all-findings-list">${{renderAllFindings(active)}}</div>`;
   }}
   if (gone.length) {{
     html += `<details class="val-advanced" style="margin-top:12px"><summary>Dismissed &mdash; ${{gone.length}} (kept on record, click to review or restore)</summary>

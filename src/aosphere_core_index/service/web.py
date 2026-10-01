@@ -4073,7 +4073,7 @@ function scFinding(f, slug){
      +'onclick="gotoSection(\''+esc(slug)+'\',\''+esc(f.file)+'\')" title="Open this section in the viewer">'+esc(inner)+' ↗</a>'
    : esc(inner);
  return '<div class="sc-find '+sevCls+'">'
-   +'<div class="sc-find-top"><span class="sc-find-kind">'+esc(f.kind||'')+'</span>'
+   +'<div class="sc-find-top"><span class="sc-find-kind">'+esc(f.tag||f.kind||'')+'</span>'
    +(f.severity==='silent'?'<span class="sc-find-kind sc-find-silent">silent</span>':'')
    +'<span class="sc-find-where">'+where+'</span></div>'
    +'<div class="sc-find-title">'+esc(f.title||'')+'</div>'

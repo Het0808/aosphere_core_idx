@@ -7,6 +7,7 @@
 
      fetch('/api/jobs/<id>/…')  -> the payload, embedded gzipped in #emb-gz
      <img src="…/page_image/N">  -> rendered client-side with pdf.js from the PDF
+                                    (the Document tab asks window.aciPageImage(N) directly)
      <img src="…/page_bbox_image/N">   embedded in #emb-pdf, with Rule B's geometry
      <img src="…/assets/x.png">        drawn on top — the deployed app has no
                                        PyMuPDF and never re-parses a PDF, so the
@@ -72,17 +73,23 @@
 
   let docP = null;
   function pdfDoc() {
-    if (!docP) docP = new Promise((resolve, reject) => {
-      const s = document.createElement('script');
-      s.src = PDFJS + 'pdf.min.js';
-      s.onload = () => {
-        window.pdfjsLib.GlobalWorkerOptions.workerSrc = PDFJS + 'pdf.worker.min.js';
-        window.pdfjsLib.getDocument({ data: b64bytes(el('emb-pdf').textContent) })
-          .promise.then(resolve, reject);
-      };
-      s.onerror = () => reject(new Error('pdf.js failed to load'));
-      document.head.appendChild(s);
-    });
+    if (!docP) {
+      docP = new Promise((resolve, reject) => {
+        const s = document.createElement('script');
+        s.src = PDFJS + 'pdf.min.js';
+        s.onload = () => {
+          window.pdfjsLib.GlobalWorkerOptions.workerSrc = PDFJS + 'pdf.worker.min.js';
+          window.pdfjsLib.getDocument({ data: b64bytes(el('emb-pdf').textContent) })
+            .promise.then(resolve, reject);
+        };
+        s.onerror = () => { s.remove(); reject(new Error('pdf.js failed to load')); };
+        document.head.appendChild(s);
+      });
+      // A load that failed once (a dropped connection to the CDN, a worker that did not
+      // start) must not fail every page for the rest of the session: forget it, so the
+      // next page asked for tries again.
+      docP.catch(() => { docP = null; });
+    }
     return docP;
   }
 
@@ -125,8 +132,19 @@
       }
       return canvas.toDataURL('image/png');
     })());
+    // Same reasoning as pdfDoc(): only a page that rendered is remembered. A rejected
+    // promise left in the cache answers every later visit to that page with the same
+    // failure.
+    rendered.get(key).catch(() => rendered.delete(key));
     return rendered.get(key);
   }
+  // The dashboard's PDF viewer asks for a page IMAGE here rather than pointing an <img> at
+  // /api/jobs/<id>/page_image/N. This page is a blob: document with no server, so that URL
+  // can only fail; the browser starts loading it the moment the element is inserted, and
+  // its failure races the swapImage() below, which only runs from a MutationObserver
+  // callback afterwards. When the failure won, the dashboard's onerror replaced the <img>
+  // with "page N could not be rendered", and the finished render had nowhere to go.
+  window.aciPageImage = pno => pageImage(pno, false);
 
   const IMG_RE = /\/api\/jobs\/[^/]+\/(page_image|page_bbox_image|assets)\/([^/?#]+)/;
   function swapImage(img) {
